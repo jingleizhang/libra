@@ -6,22 +6,18 @@ use crate::{
     OP_COUNTERS,
 };
 use bounded_executor::BoundedExecutor;
-use config::config::{MempoolConfig, NodeConfig};
-use failure::prelude::*;
 use futures::sync::mpsc::UnboundedSender;
-use futures_preview::{
-    compat::{Future01CompatExt, Stream01CompatExt},
-    future::join_all,
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
-};
-use logger::prelude::*;
+use futures_preview::{compat::Future01CompatExt, future::join_all, Stream, StreamExt};
+use libra_config::config::{MempoolConfig, NodeConfig};
+use libra_logger::prelude::*;
+use libra_types::{transaction::SignedTransaction, PeerId};
 use network::{
     proto::MempoolSyncMsg,
     validator_network::{Event, MempoolNetworkEvents, MempoolNetworkSender},
 };
-use proto_conv::{FromProto, IntoProto};
 use std::{
     collections::HashMap,
+    convert::{TryFrom, TryInto},
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -29,10 +25,9 @@ use std::{
 };
 use storage_client::StorageRead;
 use tokio::{
-    runtime::{Builder, Runtime, TaskExecutor},
-    timer::Interval,
+    runtime::{Builder, Handle, Runtime},
+    time::interval,
 };
-use types::{transaction::SignedTransaction, PeerId};
 use vm_validator::vm_validator::{get_account_state, TransactionValidation};
 
 /// state of last sync with peer
@@ -50,7 +45,7 @@ type PeerInfo = HashMap<PeerId, PeerSyncState>;
 #[derive(Debug)]
 pub(crate) struct SyncEvent;
 
-type IntervalStream = Pin<Box<dyn Stream<Item = Result<SyncEvent>> + Send + 'static>>;
+type IntervalStream = Pin<Box<dyn Stream<Item = SyncEvent> + Send + 'static>>;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SharedMempoolNotification {
@@ -102,10 +97,8 @@ fn notify_subscribers(
 }
 
 fn default_timer(tick_ms: u64) -> IntervalStream {
-    Interval::new_interval(Duration::from_millis(tick_ms))
-        .compat()
-        .map_ok(|_| SyncEvent)
-        .map_err(|_| format_err!("[shared mempool] timer tick error"))
+    interval(Duration::from_millis(tick_ms))
+        .map(|_| SyncEvent)
         .boxed()
 }
 
@@ -164,18 +157,17 @@ async fn sync_with_peers<'a>(
 
             if !transactions.is_empty() {
                 OP_COUNTERS.inc_by("smp.sync_with_peers", transactions.len());
-                let mut msg = MempoolSyncMsg::new();
-                msg.set_peer_id(peer_id.into());
-                msg.set_transactions(
-                    transactions
-                        .into_iter()
-                        .map(IntoProto::into_proto)
-                        .collect(),
-                );
+                let mut msg = MempoolSyncMsg::default();
+                msg.peer_id = peer_id.into();
+                msg.transactions = transactions
+                    .into_iter()
+                    .map(|txn| txn.try_into().unwrap())
+                    .collect();
 
-                debug!(
+                trace!(
                     "MempoolNetworkSender.send_to peer {} msg {:?}",
-                    peer_id, msg
+                    peer_id,
+                    msg
                 );
                 // Since this is a direct-send, this will only error if the network
                 // module has unexpectedly crashed or shutdown.
@@ -281,16 +273,8 @@ where
 
     while let Some(sync_event) = interval.next().await {
         trace!("SyncEvent: {:?}", sync_event);
-        match sync_event {
-            Ok(_) => {
-                sync_with_peers(&peer_info, &mempool, &mut network_sender, batch_size).await;
-                notify_subscribers(SharedMempoolNotification::Sync, &subscribers);
-            }
-            Err(e) => {
-                error!("Error in outbound_sync_task timer interval: {:?}", e);
-                break;
-            }
-        }
+        sync_with_peers(&peer_info, &mempool, &mut network_sender, batch_size).await;
+        notify_subscribers(SharedMempoolNotification::Sync, &subscribers);
     }
 
     crit!("SharedMempool outbound_sync_task terminated");
@@ -299,7 +283,7 @@ where
 /// This task handles inbound network events.
 async fn inbound_network_task<V>(
     smp: SharedMempool<V>,
-    executor: TaskExecutor,
+    executor: Handle,
     mut network_events: MempoolNetworkEvents,
 ) where
     V: TransactionValidation,
@@ -326,12 +310,13 @@ async fn inbound_network_task<V>(
                     lost_peer(&peer_info, peer_id);
                     notify_subscribers(SharedMempoolNotification::PeerStateChange, &subscribers);
                 }
-                Event::Message((peer_id, mut msg)) => {
+                Event::Message((peer_id, msg)) => {
                     OP_COUNTERS.inc("smp.event.message");
                     let transactions: Vec<_> = msg
-                        .take_transactions()
+                        .transactions
+                        .clone()
                         .into_iter()
-                        .filter_map(|txn| match SignedTransaction::from_proto(txn) {
+                        .filter_map(|txn| match SignedTransaction::try_from(txn) {
                             Ok(t) => Some(t),
                             Err(e) => {
                                 security_log(SecurityEvent::InvalidTransactionMP)
@@ -374,20 +359,12 @@ async fn inbound_network_task<V>(
 
 /// GC all expired transactions by SystemTTL
 async fn gc_task(mempool: Arc<Mutex<CoreMempool>>, gc_interval_ms: u64) {
-    let mut interval = Interval::new_interval(Duration::from_millis(gc_interval_ms)).compat();
-    while let Some(res) = interval.next().await {
-        match res {
-            Ok(_) => {
-                mempool
-                    .lock()
-                    .expect("[shared mempool] failed to acquire mempool lock")
-                    .gc_by_system_ttl();
-            }
-            Err(e) => {
-                error!("Error in gc_task timer interval: {:?}", e);
-                break;
-            }
-        }
+    let mut interval = interval(Duration::from_millis(gc_interval_ms));
+    while let Some(_interval) = interval.next().await {
+        mempool
+            .lock()
+            .expect("[shared mempool] failed to acquire mempool lock")
+            .gc_by_system_ttl();
     }
 
     crit!("SharedMempool gc_task terminated");
@@ -412,10 +389,12 @@ where
     V: TransactionValidation + 'static,
 {
     let runtime = Builder::new()
-        .name_prefix("shared-mem-")
+        .thread_name("shared-mem-")
+        .threaded_scheduler()
+        .enable_all()
         .build()
         .expect("[shared mempool] failed to create runtime");
-    let executor = runtime.executor();
+    let executor = runtime.handle();
 
     let peer_info = Arc::new(Mutex::new(PeerInfo::new()));
 
@@ -429,29 +408,21 @@ where
         subscribers,
     };
 
-    let interval =
-        timer.unwrap_or_else(|| default_timer(config.mempool.shared_mempool_tick_interval_ms));
+    let interval_ms = config.mempool.shared_mempool_tick_interval_ms;
+    let smp_outbound = smp.clone();
+    let f = async move {
+        let interval = timer.unwrap_or_else(|| default_timer(interval_ms));
+        outbound_sync_task(smp_outbound, interval).await
+    };
 
-    executor.spawn(
-        outbound_sync_task(smp.clone(), interval)
-            .boxed()
-            .unit_error()
-            .compat(),
-    );
+    executor.spawn(f);
 
-    executor.spawn(
-        inbound_network_task(smp, executor.clone(), network_events)
-            .boxed()
-            .unit_error()
-            .compat(),
-    );
+    executor.spawn(inbound_network_task(smp, executor.clone(), network_events));
 
-    executor.spawn(
-        gc_task(mempool, config.mempool.system_transaction_gc_interval_ms)
-            .boxed()
-            .unit_error()
-            .compat(),
-    );
+    executor.spawn(gc_task(
+        mempool,
+        config.mempool.system_transaction_gc_interval_ms,
+    ));
 
     runtime
 }

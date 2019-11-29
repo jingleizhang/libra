@@ -1,3 +1,6 @@
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! This file defines system store APIs that operates data not part of the Libra core data
 //! structures but information with regard to system running status, statistics, etc.
 
@@ -6,10 +9,10 @@ use crate::{
     schema::ledger_counters::LedgerCountersSchema,
 };
 use failure::prelude::*;
-use logger::prelude::*;
+use libra_logger::prelude::*;
+use libra_types::transaction::Version;
 use schemadb::{SchemaBatch, DB};
 use std::sync::Arc;
-use types::transaction::Version;
 
 pub(crate) struct SystemStore {
     db: Arc<DB>,

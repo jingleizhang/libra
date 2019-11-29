@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! Constants for the binary format.
 //!
 //! Definition for the constants of the binary format, used by the serializer and the deserializer.
@@ -168,10 +170,9 @@ pub enum Opcodes {
     IMM_BORROW_GLOBAL       = 0x30,
     MOVE_FROM               = 0x31,
     MOVE_TO                 = 0x32,
-    CREATE_ACCOUNT          = 0x33,
-    GET_TXN_SEQUENCE_NUMBER = 0x34,
-    GET_TXN_PUBLIC_KEY      = 0x35,
-    FREEZE_REF              = 0x36,
+    GET_TXN_SEQUENCE_NUMBER = 0x33,
+    GET_TXN_PUBLIC_KEY      = 0x34,
+    FREEZE_REF              = 0x35,
 }
 
 /// Upper limit on the binary size

@@ -20,11 +20,11 @@ use crate::{
 use channel;
 use futures::{
     channel::oneshot,
-    compat::Future01CompatExt,
     future::{BoxFuture, FutureExt},
     stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
 };
-use logger::prelude::*;
+use libra_logger::prelude::*;
+use libra_types::PeerId;
 use parity_multiaddr::Multiaddr;
 use std::{
     cmp::min,
@@ -33,8 +33,7 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
-use tokio::timer;
-use types::PeerId;
+use tokio::time;
 
 #[cfg(test)]
 mod test;
@@ -220,10 +219,10 @@ where
             .peer_addresses
             .iter()
             .filter(|(peer_id, addrs)| {
-                eligible.contains_key(peer_id)
-                    && self.connected.get(peer_id).is_none()
-                    && self.dial_queue.get(peer_id).is_none()
-                    && !addrs.is_empty()
+                eligible.contains_key(peer_id)  // The node is eligible to be dialed.
+                    && self.connected.get(peer_id).is_none() // The node is not already connected.
+                    && self.dial_queue.get(peer_id).is_none() // There is no pending dial to this node.
+                    && !addrs.is_empty() // There is an address to dial.
             })
             .collect();
 
@@ -261,8 +260,7 @@ where
             // the next dial attempt for this peer.
             let now = Instant::now();
             let dial_delay = dial_state.next_backoff_delay(max_delay);
-            let dial_time = now.checked_add(dial_delay).unwrap_or_else(Instant::now);
-            let f_delay = timer::Delay::new(dial_time);
+            let f_delay = time::delay_for(dial_delay);
 
             let (cancel_tx, cancel_rx) = oneshot::channel();
 
@@ -280,12 +278,14 @@ where
                     "Dial future: dialing peer: {}, at address: {}, after delay: {:?}",
                     peer_id.short_str(),
                     addr,
-                    f_delay.deadline().duration_since(now)
+                    f_delay
+                        .deadline()
+                        .duration_since(tokio::time::Instant::from_std(now))
                 );
                 // We dial after a delay. The dial can be cancelled by sending to or dropping
                 // `cancel_rx`.
                 let dial_result = ::futures::select! {
-                    _ = f_delay.compat().fuse() => {
+                    _ = f_delay.fuse() => {
                         info!("Dialing peer: {}, at addr: {}", peer_id.short_str(), addr);
                         match peer_mgr_reqs_tx.dial_peer(peer_id, addr.clone()).await {
                             Ok(_) => DialResult::Success,
@@ -324,6 +324,10 @@ where
     fn handle_request(&mut self, req: ConnectivityRequest) {
         match req {
             ConnectivityRequest::UpdateAddresses(peer_id, addrs) => {
+                trace!(
+                    "Received updated addresses for peer: {}",
+                    peer_id.short_str()
+                );
                 self.peer_addresses.insert(peer_id, addrs);
                 // Ensure that the next dial attempt starts from the first addr.
                 if let Some(dial_state) = self.dial_states.get_mut(&peer_id) {
@@ -331,6 +335,7 @@ where
                 }
             }
             ConnectivityRequest::UpdateEligibleNodes(nodes) => {
+                trace!("Received updated list of eligible nodes",);
                 *self.eligible.write().unwrap() = nodes;
             }
             ConnectivityRequest::GetDialQueueSize(sender) => {
@@ -391,7 +396,7 @@ fn log_dial_result(peer_id: PeerId, addr: Multiaddr, dial_result: DialResult) {
             }
             e => {
                 info!(
-                    "Failed to connect to peer: {} at address: {}. Error: {:?}",
+                    "Failed to connect to peer: {} at address: {}; error: {}",
                     peer_id.short_str(),
                     addr,
                     e

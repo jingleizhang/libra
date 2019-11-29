@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) The Libra Core Contributors
+# SPDX-License-Identifier: Apache-2.0
 
 # This script builds the libra configs
 # and then checks for git modified files in the generated configs
@@ -8,12 +10,12 @@
 # - Script is running inside the git repository, with git command available
 # - Script is run from repo's top level folder
 
+set -e
+
 # Generate Configs
 echo "--- Generating all the configs ---"
 cd terraform/validator-sets
-./build.sh dev -n 4
-./build.sh 60 -n 60
-./build.sh 100 -n 100
+./build-all.sh
 
 # Compare configs
 # Notice: This is not comparing all configs yet.
@@ -23,7 +25,7 @@ git checkout -- '**/seed_peers.config.toml'
 git update-index --refresh
 
 echo "--- Compare configs ---"
-changes=$(git diff-index HEAD -- '**/genesis.blob' '**/trusted_peers.config.toml' '**/node.keys.toml')
+changes=$(git diff-index HEAD -- '**/consensus_peers.config.toml' '**/node.consensus.keys.toml' '**/network_peers.config.toml' '**/node.network.keys.toml' '**/genesis.blob')
 if [ -z "$changes" ];
 then
 	# nothing to do

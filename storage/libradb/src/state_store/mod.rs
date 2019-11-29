@@ -13,18 +13,19 @@ use crate::{
         jellyfish_merkle_node::JellyfishMerkleNodeSchema, stale_node_index::StaleNodeIndexSchema,
     },
 };
-use crypto::{hash::CryptoHash, HashValue};
 use failure::prelude::*;
 use jellyfish_merkle::{
-    node_type::{Node, NodeKey},
+    iterator::JellyfishMerkleIterator,
+    node_type::{LeafNode, Node, NodeKey},
     JellyfishMerkleTree, TreeReader,
 };
-use schemadb::DB;
-use std::{collections::HashMap, sync::Arc};
-use types::{
+use libra_crypto::{hash::CryptoHash, HashValue};
+use libra_types::{
     account_address::AccountAddress, account_state_blob::AccountStateBlob,
     proof::SparseMerkleProof, transaction::Version,
 };
+use schemadb::DB;
+use std::{collections::HashMap, sync::Arc};
 
 pub(crate) struct StateStore {
     db: Arc<DB>,
@@ -97,10 +98,25 @@ impl StateStore {
 
         Ok(new_root_hash_vec)
     }
+
+    /// Returns an iterator that yields all accounts from left to right that is not less than
+    /// `starting_key`, one entry at a time, at given version.
+    #[allow(dead_code)]
+    pub fn iter_accounts<'a>(
+        &'a self,
+        version: Version,
+        starting_key: HashValue,
+    ) -> Result<JellyfishMerkleIterator<'a, Self>> {
+        JellyfishMerkleIterator::new(self, version, starting_key)
+    }
 }
 
 impl TreeReader for StateStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
         Ok(self.db.get::<JellyfishMerkleNodeSchema>(node_key)?)
+    }
+
+    fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
+        unimplemented!();
     }
 }

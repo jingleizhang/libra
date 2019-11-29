@@ -1,12 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::Accumulator;
+#![forbid(unsafe_code)]
+
+use super::InMemoryAccumulator;
 use crate::proof::{
+    definition::LeafCount,
     position::{FrozenSubtreeSiblingIterator, Position},
     TestAccumulatorInternalNode,
 };
-use crypto::{
+use libra_crypto::{
     hash::{CryptoHash, TestOnlyHash, TestOnlyHasher, ACCUMULATOR_PLACEHOLDER_HASH},
     HashValue,
 };
@@ -76,7 +79,7 @@ fn compute_root_hash_naive(leaves: &[HashValue]) -> HashValue {
 
     let rightmost_leaf_index = leaves.len() as u64 - 1;
     *position_to_hash
-        .get(&Position::get_root_position(rightmost_leaf_index))
+        .get(&Position::root_from_leaf_index(rightmost_leaf_index))
         .expect("Root position should exist in the map.")
 }
 
@@ -96,14 +99,14 @@ fn test_accumulator_append() {
         .collect();
 
     let leaves = create_leaves(0..100);
-    let mut accumulator = Accumulator::<TestOnlyHasher>::default();
+    let mut accumulator = InMemoryAccumulator::<TestOnlyHasher>::default();
     // Append the leaves one at a time and check the root hashes match.
     for (i, (leaf, expected_root_hash)) in
         itertools::zip_eq(leaves.into_iter(), expected_root_hashes.into_iter()).enumerate()
     {
         assert_eq!(accumulator.root_hash(), expected_root_hash);
-        assert_eq!(accumulator.num_leaves(), i as u64);
-        accumulator = accumulator.append(vec![leaf]);
+        assert_eq!(accumulator.num_leaves(), i as LeafCount);
+        accumulator = accumulator.append(&[leaf]);
     }
 }
 
@@ -114,7 +117,7 @@ proptest! {
         hashes2 in vec(any::<HashValue>(), 0..100),
     ) {
         // Construct an accumulator with hashes1.
-        let accumulator = Accumulator::<TestOnlyHasher>::default().append(hashes1.clone());
+        let accumulator = InMemoryAccumulator::<TestOnlyHasher>::from_leaves(&hashes1);
 
         // Compute all the internal nodes in a bigger accumulator with combination of hashes1 and
         // hashes2.
@@ -123,11 +126,11 @@ proptest! {
         let position_to_hash = compute_hashes_for_all_positions(&all_hashes);
 
         let subtree_hashes: Vec<_> =
-            FrozenSubtreeSiblingIterator::new(hashes1.len() as u64, all_hashes.len() as u64)
+            FrozenSubtreeSiblingIterator::new(hashes1.len() as LeafCount, all_hashes.len() as LeafCount)
                 .filter_map(|pos| position_to_hash.get(&pos).cloned())
                 .collect();
         let new_accumulator = accumulator
-            .append_subtrees(&subtree_hashes, hashes2.len() as u64)
+            .append_subtrees(&subtree_hashes, hashes2.len() as LeafCount)
             .unwrap();
         prop_assert_eq!(
             new_accumulator.root_hash(),

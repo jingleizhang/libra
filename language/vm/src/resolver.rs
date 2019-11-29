@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! This module implements a resolver for importing a SignatureToken defined in one module into
 //! another. This functionaliy is used in verify_module_dependencies and verify_script_dependencies.
 use crate::{
@@ -10,12 +12,12 @@ use crate::{
         SignatureToken, StructHandle, StructHandleIndex,
     },
 };
-use std::collections::BTreeMap;
-use types::{
+use libra_types::{
     account_address::AccountAddress,
     identifier::Identifier,
     vm_error::{StatusCode, VMStatus},
 };
+use std::collections::BTreeMap;
 
 /// Resolution context for importing types
 pub struct Resolver {

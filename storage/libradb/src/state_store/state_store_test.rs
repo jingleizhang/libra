@@ -3,13 +3,13 @@
 
 use super::*;
 use crate::{pruner, LibraDB};
-use crypto::hash::CryptoHash;
-use tools::tempdir::TempPath;
-use types::{
+use libra_crypto::hash::CryptoHash;
+use libra_tools::tempdir::TempPath;
+use libra_types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
     account_state_blob::AccountStateBlob,
-    proof::verify_sparse_merkle_element,
 };
+use proptest::{collection::hash_map, prelude::*};
 
 fn put_account_state_set(
     store: &StateStore,
@@ -52,12 +52,16 @@ fn put_account_state_set(
 fn prune_stale_indices(
     store: &StateStore,
     least_readable_version: Version,
+    target_least_readable_version: Version,
     limit: usize,
-    expected_num_pruned: usize,
 ) {
-    let (num_pruned, _last_seen_version) =
-        pruner::prune_state(Arc::clone(&store.db), 0, least_readable_version, limit).unwrap();
-    assert_eq!(num_pruned, expected_num_pruned);
+    pruner::prune_state(
+        Arc::clone(&store.db),
+        least_readable_version,
+        target_least_readable_version,
+        limit,
+    )
+    .unwrap();
 }
 
 fn verify_state_in_store(
@@ -71,7 +75,7 @@ fn verify_state_in_store(
         .get_account_state_with_proof_by_version(address, version)
         .unwrap();
     assert_eq!(value.as_ref(), expected_value);
-    verify_sparse_merkle_element(root, address.hash(), &value, &proof).unwrap();
+    proof.verify(root, address.hash(), value.as_ref()).unwrap();
 }
 
 #[test]
@@ -184,18 +188,18 @@ fn test_retired_records() {
     // Prune with limit=0, nothing is gone.
     {
         prune_stale_indices(
-            store, 1, /* least_readable_version */
+            store, 0, /* least_readable_version */
+            1, /* target_least_readable_version */
             0, /* limit */
-            0, /* expected_num_purged */
         );
         verify_state_in_store(store, address1, Some(&value1), 0, root0);
     }
     // Prune till version=1.
     {
         prune_stale_indices(
-            store, 1,   /* least_readable_version */
+            store, 0,   /* least_readable_version */
+            1,   /* target_least_readable_version */
             100, /* limit */
-            2,   /* expected_num_purged */
         );
         // root0 is gone.
         assert!(store
@@ -209,9 +213,9 @@ fn test_retired_records() {
     // Prune till version=2.
     {
         prune_stale_indices(
-            store, 2,   /* least_readable_version */
+            store, 1,   /* least_readable_version */
+            2,   /* target_least_readable_version */
             100, /* limit */
-            2,   /* expected_num_purged */
         );
         // root1 is gone.
         assert!(store
@@ -221,5 +225,46 @@ fn test_retired_records() {
         verify_state_in_store(store, address1, Some(&value1), 2, root2);
         verify_state_in_store(store, address2, Some(&value2_update), 2, root2);
         verify_state_in_store(store, address3, Some(&value3_update), 2, root2);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    #[test]
+    fn test_iter_accounts(
+        input in hash_map(any::<AccountAddress>(), any::<AccountStateBlob>(), 1..200)
+    ) {
+        // Convert to a vector so iteration order becomes deterministic.
+        let kvs: Vec<_> = input.into_iter().collect();
+
+        let tmp_dir = TempPath::new();
+        let db = LibraDB::new(&tmp_dir);
+        let store = &db.state_store;
+
+        for (i, (key, value)) in kvs.iter().enumerate() {
+            // Insert one key at each version.
+            let mut cs = ChangeSet::new();
+            let account_state_set: HashMap<_, _> = std::iter::once((*key, value.clone())).collect();
+            store
+                .put_account_state_sets(vec![account_state_set], i as Version, &mut cs)
+                .unwrap();
+            store.db.write_schemas(cs.batch).unwrap();
+        }
+
+        // Test iterator at each version.
+        for i in 0..kvs.len() {
+            let actual_values = store
+                .iter_accounts(i as Version, HashValue::zero())
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            let mut expected_values: Vec<_> = kvs[..=i]
+                .iter()
+                .map(|(addr, account)| (addr.hash(), account.clone()))
+                .collect();
+            expected_values.sort_unstable_by_key(|item| item.0);
+            prop_assert_eq!(actual_values, expected_values);
+        }
     }
 }

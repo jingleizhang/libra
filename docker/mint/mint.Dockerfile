@@ -1,10 +1,10 @@
-FROM debian:stretch as builder
+FROM debian:buster AS toolchain
 
 # To use http/https proxy while building, use:
 # docker build --build-arg https_proxy=http://fwdproxy:8080 --build-arg http_proxy=http://fwdproxy:8080
 
-RUN echo "deb http://deb.debian.org/debian stretch-backports main" > /etc/apt/sources.list.d/backports.list \
-    && apt-get update && apt-get install -y protobuf-compiler/stretch-backports cmake golang curl \
+RUN echo "deb http://deb.debian.org/debian buster-backports main" > /etc/apt/sources.list.d/backports.list \
+    && apt-get update && apt-get install -y protobuf-compiler/buster cmake curl clang git \
     && apt-get clean && rm -r /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
@@ -14,11 +14,14 @@ WORKDIR /libra
 COPY rust-toolchain /libra/rust-toolchain
 RUN rustup install $(cat rust-toolchain)
 
+FROM toolchain AS builder
+
 COPY . /libra
-RUN cargo build --release -p libra_node -p client -p benchmark
+
+RUN cargo build --release -p libra-node -p client -p benchmark && cd target/release && rm -r build deps incremental
 
 ### Production Image ###
-FROM debian:stretch
+FROM debian:buster AS prod
 
 # TODO: Unsure which of these are needed exactly for client
 RUN apt-get update && apt-get install -y python3-pip nano net-tools tcpdump iproute2 netcat \
@@ -44,7 +47,6 @@ CMD cd /opt/libra/etc && echo "$MINT_KEY" | \
     base64 -d > mint.key && \
     cd /opt/libra/bin && \
     exec gunicorn --bind 0.0.0.0:8000 --access-logfile - --error-logfile - --log-level $LOG_LEVEL server
-
 
 ARG BUILD_DATE
 ARG GIT_REV

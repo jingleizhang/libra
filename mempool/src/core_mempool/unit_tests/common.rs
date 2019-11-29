@@ -1,24 +1,22 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    core_mempool::{CoreMempool, TimelineState, TxnPointer},
-    proto::shared::mempool_status::MempoolAddTransactionStatusCode,
-};
-use config::config::NodeConfigHelpers;
-use crypto::ed25519::*;
+use crate::core_mempool::{CoreMempool, TimelineState, TxnPointer};
 use failure::prelude::*;
 use lazy_static::lazy_static;
+use libra_config::config::NodeConfig;
+use libra_crypto::ed25519::*;
+use libra_mempool_shared_proto::proto::mempool_status::MempoolAddTransactionStatusCode;
+use libra_types::{
+    account_address::AccountAddress,
+    transaction::{RawTransaction, Script, SignedTransaction},
+};
 use rand::{rngs::StdRng, SeedableRng};
 use std::{collections::HashSet, iter::FromIterator};
-use types::{
-    account_address::AccountAddress,
-    transaction::{Program, RawTransaction, SignedTransaction},
-};
 
 pub(crate) fn setup_mempool() -> (CoreMempool, ConsensusMock) {
     (
-        CoreMempool::new(&NodeConfigHelpers::get_single_node_test_config(true)),
+        CoreMempool::new(&NodeConfig::random()),
         ConsensusMock::new(),
     )
 }
@@ -70,10 +68,10 @@ impl TestTransaction {
         max_gas_amount: u64,
         exp_time: std::time::Duration,
     ) -> SignedTransaction {
-        let raw_txn = RawTransaction::new(
+        let raw_txn = RawTransaction::new_script(
             TestTransaction::get_address(self.address),
             self.sequence_number,
-            Program::new(vec![], vec![], vec![]),
+            Script::new(vec![], vec![]),
             max_gas_amount,
             self.gas_price,
             exp_time,

@@ -1,4 +1,7 @@
-use logger::prelude::*;
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+use libra_logger::prelude::*;
 use std::{thread, time, vec::IntoIter};
 
 /// Items are returned in the world of microseconds.

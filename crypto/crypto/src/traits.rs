@@ -10,6 +10,7 @@ use crate::HashValue;
 use core::convert::{From, TryFrom};
 use failure::prelude::*;
 use std::{fmt::Debug, hash::Hash};
+use thiserror::Error;
 
 /// An error type for key and signature validation issues, see [`ValidKey`][ValidKey].
 ///
@@ -18,25 +19,20 @@ use std::{fmt::Debug, hash::Hash};
 /// (often, due to mangled material or curve equation failure for ECC) and
 /// validation errors (material recognizable but unacceptable for use,
 /// e.g. unsafe).
-#[derive(Clone, Debug, PartialEq, Eq, failure::prelude::Fail)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("{:?}", self)]
 pub enum CryptoMaterialError {
     /// Key or signature material does not deserialize correctly.
-    #[fail(display = "DeserializationError")]
     DeserializationError,
     /// Key or signature material deserializes, but is otherwise not valid.
-    #[fail(display = "ValidationError")]
     ValidationError,
     /// Key or signature material does not have the expected size.
-    #[fail(display = "WrongLengthError")]
     WrongLengthError,
     /// Part of the signature or key is not canonical resulting to malleability issues.
-    #[fail(display = "CanonicalRepresentationError")]
     CanonicalRepresentationError,
     /// A curve point (i.e., a public key) lies on a small group.
-    #[fail(display = "SmallSubgroupError")]
     SmallSubgroupError,
     /// A curve point (i.e., a public key) does not satisfy the curve equation.
-    #[fail(display = "PointNotOnCurveError")]
     PointNotOnCurveError,
 }
 
@@ -54,12 +50,6 @@ pub trait ValidKey:
     // The for<'a> exactly matches the assumption "deserializable from any lifetime".
     for<'a> TryFrom<&'a [u8], Error = CryptoMaterialError> + Debug
 {
-    /// TryFrom is the source of truth on whether we can build a valid key.
-    /// => we can use it once we've built, to validate!
-    fn validate(&self) -> std::result::Result<(), CryptoMaterialError> {
-        Self::try_from(self.to_bytes().as_slice())?;
-        Ok(())
-    }
 
     /// Convert the valid key to bytes.
     fn to_bytes(&self) -> Vec<u8>;

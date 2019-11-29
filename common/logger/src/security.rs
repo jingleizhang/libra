@@ -39,6 +39,12 @@ pub enum SecurityEvent {
     /// Consensus received an invalid sync info message
     InvalidSyncInfoMsg,
 
+    /// HealthChecker received an invalid network event
+    InvalidNetworkEventHC,
+
+    /// HealthChecker received an invalid message
+    InvalidHealthCheckerMsg,
+
     /// A block being committed or executed is invalid
     InvalidBlock,
 
@@ -69,7 +75,7 @@ pub enum SecurityEvent {
 ///
 /// # Example:
 /// ```rust
-/// use logger::prelude::*;
+/// use libra_logger::prelude::*;
 /// use std::fmt::Debug;
 ///
 /// #[derive(Debug)]
@@ -83,7 +89,6 @@ pub enum SecurityEvent {
 ///     Error,
 /// }
 ///
-/// pub fn main() {
 ///     security_log(SecurityEvent::InvalidTransactionAC)
 ///         .error(&TestError::Error)
 ///         .data(&SampleData {
@@ -93,7 +98,6 @@ pub enum SecurityEvent {
 ///         .data("additional payload")
 ///         .backtrace(100)
 ///         .log();
-/// }
 /// ```
 /// In this example, `security_log()` logs an event of type `SecurityEvent::InvalidTransactionAC`,
 /// having `TestError::Error` as application error, a `SimpleData` struct and a `String` as
@@ -154,10 +158,7 @@ impl SecurityLog {
     }
 
     pub(crate) fn to_string(&self) -> String {
-        match serde_json::to_string(&self) {
-            Ok(s) => s,
-            Err(e) => e.to_string(),
-        }
+        serde_json::to_string(&self).unwrap_or_else(|e| e.to_string())
     }
 
     /// Prints the `SecurityEvent` struct.
@@ -195,5 +196,4 @@ mod tests {
             r#"{"event":"TestError","error":"Error","data":["SampleData { i: 255, s: [144, 205, 128] }","\"second_payload\""],"backtrace":null}"#,
         );
     }
-
 }

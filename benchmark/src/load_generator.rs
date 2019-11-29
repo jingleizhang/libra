@@ -8,16 +8,17 @@ use crate::OP_COUNTER;
 use admission_control_proto::proto::admission_control::SubmitTransactionRequest;
 use client::{AccountData, AccountStatus};
 use failure::prelude::*;
-use libra_wallet::wallet_library::WalletLibrary;
-use logger::prelude::*;
-use proto_conv::IntoProto;
-use types::{
+use libra_logger::prelude::*;
+use libra_types::{
     account_address::AccountAddress,
     get_with_proof::{RequestItem, UpdateToLatestLedgerRequest},
-    proto::get_with_proof::UpdateToLatestLedgerRequest as ProtoUpdateToLatestLedgerRequest,
-    transaction::Program,
-    transaction_helpers::{create_signed_txn, TransactionSigner},
+    proto::types::UpdateToLatestLedgerRequest as ProtoUpdateToLatestLedgerRequest,
+    transaction::{
+        helpers::{create_user_txn, TransactionSigner},
+        Script, TransactionPayload,
+    },
 };
+use libra_wallet::wallet_library::WalletLibrary;
 
 /// Placeholder values used to generate offline TXNs.
 const MAX_GAS_AMOUNT: u64 = 1_000_000;
@@ -86,15 +87,15 @@ pub fn gen_accounts_from_wallet(wallet: &mut WalletLibrary, num_accounts: u64) -
 
 /// Craft a generic signed transaction request.
 fn gen_submit_transaction_request<T: TransactionSigner>(
-    program: Program,
+    program: Script,
     sender_account: &mut AccountData,
     signer: &T,
 ) -> Result<Request> {
     // If generation fails here, sequence number will not be increased,
     // so it is fine to continue later generation.
-    let signed_txn = create_signed_txn(
+    let transaction = create_user_txn(
         signer,
-        program,
+        TransactionPayload::Script(program),
         sender_account.address,
         sender_account.sequence_number,
         MAX_GAS_AMOUNT,
@@ -105,8 +106,8 @@ fn gen_submit_transaction_request<T: TransactionSigner>(
         OP_COUNTER.inc("create_txn_request.failure");
         Err(e)
     })?;
-    let mut req = SubmitTransactionRequest::new();
-    req.set_signed_txn(signed_txn.into_proto());
+    let mut req = SubmitTransactionRequest::default();
+    req.transaction = Some(transaction.into());
     sender_account.sequence_number += 1;
     OP_COUNTER.inc("create_txn_request.success");
     Ok(Request::WriteRequest(req))
@@ -117,7 +118,7 @@ fn gen_mint_txn_request(
     faucet_account: &mut AccountData,
     receiver: &AccountAddress,
 ) -> Result<Request> {
-    let program = vm_genesis::encode_mint_program(receiver, FREE_LUNCH);
+    let program = transaction_builder::encode_mint_script(receiver, FREE_LUNCH);
     let signer = faucet_account
         .key_pair
         .as_ref()
@@ -133,7 +134,7 @@ fn gen_transfer_txn_request(
     wallet: &WalletLibrary,
     num_coins: u64,
 ) -> Result<Request> {
-    let program = vm_genesis::encode_transfer_program(&receiver, num_coins);
+    let program = transaction_builder::encode_transfer_script(&receiver, num_coins);
     gen_submit_transaction_request(program, sender, wallet)
 }
 
@@ -177,7 +178,7 @@ pub fn gen_get_txn_by_sequnece_number_request(
     };
     let request_items = vec![req_item];
     let req = UpdateToLatestLedgerRequest::new(0, request_items);
-    Request::ReadRequest(req.into_proto())
+    Request::ReadRequest(req.into())
 }
 
 /// -------------------------------------------------------------------------------- ///

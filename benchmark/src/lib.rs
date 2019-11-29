@@ -1,19 +1,21 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use admission_control_proto::proto::{
+    admission_control::AdmissionControlClient,
     admission_control::SubmitTransactionResponse as ProtoSubmitTransactionResponse,
-    admission_control_grpc::AdmissionControlClient,
 };
 use client::{AccountData, AccountStatus};
-use crypto::{ed25519::*, test_utils::KeyPair};
 use generate_keypair::load_key_from_file;
 use lazy_static::lazy_static;
-use logger::prelude::*;
-use metrics::OpMetrics;
+use libra_crypto::{ed25519::*, test_utils::KeyPair};
+use libra_logger::prelude::*;
+use libra_metrics::OpMetrics;
+use libra_types::{account_address::AccountAddress, account_config::association_address};
 use rand::Rng;
 use std::{collections::HashMap, convert::TryInto, sync::Arc, thread, time};
-use types::{account_address::AccountAddress, account_config::association_address};
 
 pub mod bin_utils;
 pub mod cli_opt;

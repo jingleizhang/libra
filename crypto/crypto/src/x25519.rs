@@ -26,7 +26,7 @@
 //! # Examples
 //!
 //! ```
-//! use crypto::x25519::*;
+//! use libra_crypto::x25519::*;
 //! use rand::{rngs::StdRng, SeedableRng};
 //!
 //! // Derive an X25519 static key pair from seed using the extract-then-expand HKDF method from RFC 5869.
@@ -40,7 +40,7 @@
 //! assert_eq!(public_key1, public_key2);
 //!
 //! // Generate a random X25519 ephemeral key pair from an RNG (in this example a StdRng)
-//! use crypto::Uniform;
+//! use libra_crypto::Uniform;
 //! let seed = [1u8; 32];
 //! let mut rng: StdRng = SeedableRng::from_seed(seed);
 //! let private_key = X25519StaticPrivateKey::generate_for_testing(&mut rng);
@@ -57,9 +57,9 @@
 //! ```
 
 use crate::{hkdf::Hkdf, traits::*};
-use crypto_derive::{Deref, SilentDebug, SilentDisplay};
+use libra_crypto_derive::{Deref, SilentDebug, SilentDisplay};
 use rand::{rngs::EntropyRng, RngCore};
-use serde::{de, export, ser};
+use serde::{de, ser};
 use sha2::Sha256;
 use std::{convert::TryFrom, fmt, ops::Deref};
 use x25519_dalek;
@@ -206,9 +206,15 @@ impl ExchangeKey for X25519StaticPrivateKey {
     }
 }
 
+impl PartialEq for X25519StaticPrivateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_bytes() == other.to_bytes()
+    }
+}
+
 impl TryFrom<&[u8]> for X25519StaticPrivateKey {
     type Error = CryptoMaterialError;
-    fn try_from(bytes: &[u8]) -> std::result::Result<X25519StaticPrivateKey, CryptoMaterialError> {
+    fn try_from(bytes: &[u8]) -> Result<X25519StaticPrivateKey, CryptoMaterialError> {
         if bytes.len() != X25519_PRIVATE_KEY_LENGTH {
             return Err(CryptoMaterialError::DeserializationError);
         }
@@ -267,7 +273,7 @@ impl PublicKey for X25519StaticPublicKey {
 
 impl TryFrom<&[u8]> for X25519StaticPublicKey {
     type Error = CryptoMaterialError;
-    fn try_from(bytes: &[u8]) -> std::result::Result<X25519StaticPublicKey, CryptoMaterialError> {
+    fn try_from(bytes: &[u8]) -> Result<X25519StaticPublicKey, CryptoMaterialError> {
         if bytes.len() != X25519_PUBLIC_KEY_LENGTH {
             return Err(CryptoMaterialError::DeserializationError);
         }
@@ -294,7 +300,7 @@ impl ValidKey for X25519StaticPublicKey {
 //////////////////////////////
 
 impl ser::Serialize for X25519StaticPrivateKey {
-    fn serialize<S>(&self, serializer: S) -> export::Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: ser::Serializer,
     {
@@ -303,7 +309,7 @@ impl ser::Serialize for X25519StaticPrivateKey {
 }
 
 impl ser::Serialize for X25519StaticPublicKey {
-    fn serialize<S>(&self, serializer: S) -> export::Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: ser::Serializer,
     {
@@ -312,7 +318,6 @@ impl ser::Serialize for X25519StaticPublicKey {
 }
 
 struct X25519StaticPrivateKeyVisitor;
-
 struct X25519StaticPublicKeyVisitor;
 
 impl<'de> de::Visitor<'de> for X25519StaticPrivateKeyVisitor {
@@ -322,14 +327,11 @@ impl<'de> de::Visitor<'de> for X25519StaticPrivateKeyVisitor {
         formatter.write_str("x25519_dalek static key in bytes")
     }
 
-    fn visit_bytes<E>(self, value: &[u8]) -> export::Result<X25519StaticPrivateKey, E>
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<X25519StaticPrivateKey, E>
     where
         E: de::Error,
     {
-        match X25519StaticPrivateKey::try_from(value) {
-            Ok(key) => Ok(key),
-            Err(error) => Err(E::custom(error)),
-        }
+        X25519StaticPrivateKey::try_from(value).map_err(E::custom)
     }
 }
 
@@ -340,19 +342,16 @@ impl<'de> de::Visitor<'de> for X25519StaticPublicKeyVisitor {
         formatter.write_str("x25519_dalek public key in bytes")
     }
 
-    fn visit_bytes<E>(self, value: &[u8]) -> export::Result<X25519StaticPublicKey, E>
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<X25519StaticPublicKey, E>
     where
         E: de::Error,
     {
-        match X25519StaticPublicKey::try_from(value) {
-            Ok(key) => Ok(key),
-            Err(error) => Err(E::custom(error)),
-        }
+        X25519StaticPublicKey::try_from(value).map_err(E::custom)
     }
 }
 
 impl<'de> de::Deserialize<'de> for X25519StaticPrivateKey {
-    fn deserialize<D>(deserializer: D) -> export::Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: de::Deserializer<'de>,
     {
@@ -361,7 +360,7 @@ impl<'de> de::Deserialize<'de> for X25519StaticPrivateKey {
 }
 
 impl<'de> de::Deserialize<'de> for X25519StaticPublicKey {
-    fn deserialize<D>(deserializer: D) -> export::Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: de::Deserializer<'de>,
     {
@@ -378,9 +377,9 @@ impl<'de> de::Deserialize<'de> for X25519StaticPublicKey {
 /// disappear after.
 pub mod compat {
     use crate::traits::*;
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, feature = "fuzzing"))]
     use proptest::strategy::LazyJust;
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, feature = "fuzzing"))]
     use proptest::{prelude::*, strategy::Strategy};
 
     use crate::x25519::{X25519StaticPrivateKey, X25519StaticPublicKey};
@@ -390,7 +389,7 @@ pub mod compat {
     ///
     /// Warning: if you pass in None, this will not return distinct
     /// results every time! Should you want to write non-deterministic
-    /// tests, look at config::config_builder::util::get_test_config
+    /// tests, look at libra_config::config_builder::util::get_test_config
     pub fn generate_keypair<'a, T>(opt_rng: T) -> (X25519StaticPrivateKey, X25519StaticPublicKey)
     where
         T: Into<Option<&'a mut StdRng>> + Sized,
@@ -404,7 +403,7 @@ pub mod compat {
     }
 
     /// Used to produce keypairs from a seed for testing purposes
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn keypair_strategy(
     ) -> impl Strategy<Value = (X25519StaticPrivateKey, X25519StaticPublicKey)> {
         // The no_shrink is because keypairs should be fixed -- shrinking would cause a different
@@ -418,7 +417,7 @@ pub mod compat {
             .no_shrink()
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, feature = "fuzzing"))]
     impl Arbitrary for X25519StaticPublicKey {
         type Parameters = ();
         fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {

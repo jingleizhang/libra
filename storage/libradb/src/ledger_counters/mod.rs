@@ -1,21 +1,21 @@
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::OP_COUNTER;
-use canonical_serialization::{
-    CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-};
-use failure::prelude::*;
 use num_derive::ToPrimitive;
 use num_traits::ToPrimitive;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 use proptest::{collection::hash_map, prelude::*};
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 use proptest_derive::Arbitrary;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use strum::IntoEnumIterator;
 use strum_macros::{AsRefStr, EnumIter};
 
 /// Types of ledger counters.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ToPrimitive, EnumIter, AsRefStr)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
+#[cfg_attr(test, derive(Arbitrary))]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum LedgerCounter {
     EventsCreated = 101,
@@ -27,7 +27,7 @@ pub(crate) enum LedgerCounter {
     StaleStateNodes = 302,
 }
 
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 struct InnerLedgerCounters {
     counters: BTreeMap<u16, usize>,
 }
@@ -89,13 +89,14 @@ impl LedgerCounterBumps {
     /// Get the current value of the bump of `counter`.
     ///
     /// Defaults to 0.
+    #[cfg(test)]
     pub fn get(&mut self, counter: LedgerCounter) -> usize {
         self.bumps.get(counter)
     }
 }
 
 /// Represents ledger counter values at a certain version.
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub(crate) struct LedgerCounters {
     counters: InnerLedgerCounters,
 }
@@ -130,24 +131,7 @@ impl LedgerCounters {
     }
 }
 
-impl CanonicalSerialize for LedgerCounters {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer.encode_btreemap(&self.counters.counters)?;
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for LedgerCounters {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let counters = deserializer.decode_btreemap::<u16, usize>()?;
-
-        Ok(Self {
-            counters: InnerLedgerCounters { counters },
-        })
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 prop_compose! {
     pub(crate) fn ledger_counters_strategy()(
         counters_map in hash_map(any::<LedgerCounter>(), any::<usize>(), 0..3)
@@ -161,7 +145,7 @@ prop_compose! {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl Arbitrary for LedgerCounters {
     type Parameters = ();
     type Strategy = BoxedStrategy<Self>;

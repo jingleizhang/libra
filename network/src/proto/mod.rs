@@ -2,25 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(bare_trait_objects)]
+#![allow(clippy::large_enum_variant)]
 
 //! Protobuf definitions for data structures sent over the network
-mod consensus;
-mod mempool;
-mod network;
-mod state_synchronizer;
+mod consensus {
+    include!(concat!(env!("OUT_DIR"), "/consensus.rs"));
+}
+mod network {
+    include!(concat!(env!("OUT_DIR"), "/network.rs"));
+}
+mod mempool {
+    include!(concat!(env!("OUT_DIR"), "/mempool.rs"));
+}
+mod state_synchronizer {
+    include!(concat!(env!("OUT_DIR"), "/state_synchronizer.rs"));
+}
+mod health_checker {
+    include!(concat!(env!("OUT_DIR"), "/health_checker.rs"));
+}
 
-use types::proto::{ledger_info, transaction};
+use ::libra_types::proto::types;
 
 pub use self::{
     consensus::{
-        Block, BlockRetrievalStatus, ConsensusMsg, PacemakerTimeout, PacemakerTimeoutCertificate,
-        Proposal, QuorumCert, RequestBlock, RespondBlock, SyncInfo, TimeoutMsg, Vote, VoteData,
+        consensus_msg::Message as ConsensusMsg_oneof, Block, ConsensusMsg, Proposal, RequestBlock,
+        RequestEpoch, RespondBlock, SyncInfo, VoteMsg, VoteProposal,
+    },
+    health_checker::{
+        health_checker_msg::Message as HealthCheckerMsg_oneof, HealthCheckerMsg, Ping, Pong,
     },
     mempool::MempoolSyncMsg,
     network::{
-        DiscoveryMsg, FullNodePayload, IdentityMsg, IdentityMsg_Role, Note, PeerInfo, Ping, Pong,
-        SignedFullNodePayload, SignedPeerInfo,
+        identity_msg::Role as IdentityMsg_Role, DiscoveryMsg, FullNodePayload, IdentityMsg, Note,
+        PeerInfo, SignedFullNodePayload, SignedPeerInfo,
     },
-    state_synchronizer::{GetChunkRequest, GetChunkResponse, StateSynchronizerMsg},
+    state_synchronizer::{
+        state_synchronizer_msg::Message as StateSynchronizerMsg_oneof, GetChunkRequest,
+        GetChunkResponse, StateSynchronizerMsg,
+    },
 };
-pub use transaction::SignedTransaction;

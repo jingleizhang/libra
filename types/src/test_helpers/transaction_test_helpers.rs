@@ -1,14 +1,14 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use crate::{
     account_address::AccountAddress,
-    proto::transaction::SignedTransaction as ProtoSignedTransaction,
-    transaction::{Program, RawTransaction, SignatureCheckedTransaction, SignedTransaction},
+    transaction::{Module, RawTransaction, Script, SignatureCheckedTransaction, SignedTransaction},
     write_set::WriteSet,
 };
-use crypto::{ed25519::*, hash::CryptoHash, traits::*};
-use proto_conv::IntoProto;
+use libra_crypto::{ed25519::*, hash::CryptoHash, traits::*};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static PLACEHOLDER_SCRIPT: &[u8] = include_bytes!("fixtures/scripts/placeholder_script.mvbin");
@@ -17,20 +17,47 @@ const MAX_GAS_AMOUNT: u64 = 140_000;
 const MAX_GAS_PRICE: u64 = 1;
 
 // Test helper for transaction creation
+pub fn get_test_signed_module_publishing_transaction(
+    sender: AccountAddress,
+    sequence_number: u64,
+    private_key: Ed25519PrivateKey,
+    public_key: Ed25519PublicKey,
+    module: Module,
+) -> SignedTransaction {
+    let expiration_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 10;
+    let raw_txn = RawTransaction::new_module(
+        sender,
+        sequence_number,
+        module,
+        MAX_GAS_AMOUNT,
+        MAX_GAS_PRICE,
+        Duration::from_secs(expiration_time),
+    );
+
+    let signature = private_key.sign_message(&raw_txn.hash());
+
+    SignedTransaction::new(raw_txn, public_key, signature)
+}
+
+// Test helper for transaction creation
 pub fn get_test_signed_transaction(
     sender: AccountAddress,
     sequence_number: u64,
     private_key: Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
-    program: Option<Program>,
+    script: Option<Script>,
     expiration_time: u64,
     gas_unit_price: u64,
     max_gas_amount: Option<u64>,
-) -> ProtoSignedTransaction {
-    let raw_txn = RawTransaction::new(
+) -> SignedTransaction {
+    let raw_txn = RawTransaction::new_script(
         sender,
         sequence_number,
-        program.unwrap_or_else(placeholder_script),
+        script.unwrap_or_else(placeholder_script),
         max_gas_amount.unwrap_or(MAX_GAS_AMOUNT),
         gas_unit_price,
         Duration::from_secs(expiration_time),
@@ -38,7 +65,7 @@ pub fn get_test_signed_transaction(
 
     let signature = private_key.sign_message(&raw_txn.hash());
 
-    SignedTransaction::new(raw_txn, public_key, signature).into_proto()
+    SignedTransaction::new(raw_txn, public_key, signature)
 }
 
 // Test helper for creating transactions for which the signature hasn't been checked.
@@ -47,15 +74,15 @@ pub fn get_test_unchecked_transaction(
     sequence_number: u64,
     private_key: Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
-    program: Option<Program>,
+    script: Option<Script>,
     expiration_time: u64,
     gas_unit_price: u64,
     max_gas_amount: Option<u64>,
 ) -> SignedTransaction {
-    let raw_txn = RawTransaction::new(
+    let raw_txn = RawTransaction::new_script(
         sender,
         sequence_number,
-        program.unwrap_or_else(placeholder_script),
+        script.unwrap_or_else(placeholder_script),
         max_gas_amount.unwrap_or(MAX_GAS_AMOUNT),
         gas_unit_price,
         Duration::from_secs(expiration_time),
@@ -73,8 +100,8 @@ pub fn get_test_signed_txn(
     sequence_number: u64,
     private_key: Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
-    program: Option<Program>,
-) -> ProtoSignedTransaction {
+    script: Option<Script>,
+) -> SignedTransaction {
     let expiration_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -85,7 +112,7 @@ pub fn get_test_signed_txn(
         sequence_number,
         private_key,
         public_key,
-        program,
+        script,
         expiration_time,
         MAX_GAS_PRICE,
         None,
@@ -97,7 +124,7 @@ pub fn get_test_unchecked_txn(
     sequence_number: u64,
     private_key: Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
-    program: Option<Program>,
+    script: Option<Script>,
 ) -> SignedTransaction {
     let expiration_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -109,15 +136,15 @@ pub fn get_test_unchecked_txn(
         sequence_number,
         private_key,
         public_key,
-        program,
+        script,
         expiration_time,
         MAX_GAS_PRICE,
         None,
     )
 }
 
-pub fn placeholder_script() -> Program {
-    Program::new(PLACEHOLDER_SCRIPT.to_vec(), vec![], vec![])
+pub fn placeholder_script() -> Script {
+    Script::new(PLACEHOLDER_SCRIPT.to_vec(), vec![])
 }
 
 pub fn get_write_set_txn(

@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! This library implements a schematized DB on top of [RocksDB](https://rocksdb.org/). It makes
 //! sure all data passed in and out are structured according to predefined schemas and prevents
 //! access to raw keys and values. This library also enforces a set of Libra specific DB options,
@@ -17,7 +19,7 @@ pub mod schema;
 use crate::schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec};
 use failure::prelude::*;
 use lazy_static::lazy_static;
-use metrics::OpMetrics;
+use libra_metrics::OpMetrics;
 use rocksdb::{
     rocksdb_options::ColumnFamilyDescriptor, CFHandle, DBOptions, Writable, WriteOptions,
 };
@@ -238,10 +240,14 @@ impl DB {
     pub fn get<S: Schema>(&self, schema_key: &S::Key) -> Result<Option<S::Value>> {
         let k = <S::Key as KeyCodec<S>>::encode_key(&schema_key)?;
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+        let time = std::time::Instant::now();
 
-        self.inner
+        let result = self
+            .inner
             .get_cf(cf_handle, &k)
-            .map_err(convert_rocksdb_err)?
+            .map_err(convert_rocksdb_err)?;
+        OP_COUNTER.observe_duration(&format!("db_get_{}", S::COLUMN_FAMILY_NAME), time.elapsed());
+        result
             .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
             .transpose()
     }
@@ -254,6 +260,24 @@ impl DB {
 
         self.inner
             .put_cf_opt(cf_handle, &k, &v, &default_write_options())
+            .map_err(convert_rocksdb_err)
+    }
+
+    /// Delete all keys in range [begin, end).
+    ///
+    /// `SK` has to be an explict type parameter since
+    /// https://github.com/rust-lang/rust/issues/44721
+    pub fn range_delete<S, SK>(&self, begin: &SK, end: &SK) -> Result<()>
+    where
+        S: Schema,
+        SK: SeekKeyCodec<S>,
+    {
+        let raw_begin = begin.encode_seek_key()?;
+        let raw_end = end.encode_seek_key()?;
+        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+
+        self.inner
+            .delete_range_cf(&cf_handle, &raw_begin, &raw_end)
             .map_err(convert_rocksdb_err)
     }
 

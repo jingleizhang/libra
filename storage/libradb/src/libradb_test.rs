@@ -6,21 +6,32 @@ use crate::{
     mock_genesis::{db_with_mock_genesis, GENESIS_INFO},
     test_helper::arb_blocks_to_commit,
 };
-use crypto::{ed25519::*, hash::CryptoHash};
-use proptest::prelude::*;
-use rusty_fork::{rusty_fork_id, rusty_fork_test, rusty_fork_test_name};
-use std::collections::HashMap;
-use tools::tempdir::TempPath;
-use types::{
+use libra_crypto::hash::CryptoHash;
+use libra_tools::tempdir::TempPath;
+use libra_types::{
     account_config::get_account_resource_or_default, contract_event::ContractEvent,
     ledger_info::LedgerInfo,
 };
+use proptest::prelude::*;
+use rusty_fork::{rusty_fork_id, rusty_fork_test, rusty_fork_test_name};
+use std::collections::HashMap;
+
+fn verify_epochs(db: &LibraDB, ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) -> Result<()> {
+    let epoch_change_lis: Vec<_> = ledger_infos_with_sigs
+        .iter()
+        .filter(|info| info.ledger_info().next_validator_set().is_some())
+        .cloned()
+        .collect();
+
+    let (_, _, proof, _) = db.update_to_latest_ledger(0, Vec::new())?;
+
+    assert_eq!(epoch_change_lis, proof.ledger_info_with_sigs);
+
+    Ok(())
+}
 
 fn test_save_blocks_impl(
-    input: Vec<(
-        Vec<TransactionToCommit>,
-        LedgerInfoWithSignatures<Ed25519Signature>,
-    )>,
+    input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>,
 ) -> Result<()> {
     let tmp_dir = TempPath::new();
     let db = db_with_mock_genesis(&tmp_dir)?;
@@ -68,15 +79,14 @@ fn test_save_blocks_impl(
         &first_batch_ledger_info,
         true, /* is_latest */
     )?;
+    let (_, ledger_infos_with_sigs): (Vec<_>, Vec<_>) = input.iter().cloned().unzip();
+    verify_epochs(&db, &ledger_infos_with_sigs)?;
 
     Ok(())
 }
 
 fn test_sync_transactions_impl(
-    input: Vec<(
-        Vec<TransactionToCommit>,
-        LedgerInfoWithSignatures<Ed25519Signature>,
-    )>,
+    input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>,
 ) -> Result<()> {
     let tmp_dir = TempPath::new();
     let db = db_with_mock_genesis(&tmp_dir)?;
@@ -298,7 +308,7 @@ fn verify_committed_transactions(
     db: &LibraDB,
     txns_to_commit: &[TransactionToCommit],
     first_version: Version,
-    ledger_info_with_sigs: &LedgerInfoWithSignatures<Ed25519Signature>,
+    ledger_info_with_sigs: &LedgerInfoWithSignatures,
     is_latest: bool,
 ) -> Result<()> {
     let ledger_info = ledger_info_with_sigs.ledger_info();
@@ -312,19 +322,29 @@ fn verify_committed_transactions(
 
         // Verify transaction hash.
         assert_eq!(
-            txn_info.signed_transaction_hash(),
-            txn_to_commit.signed_txn().hash()
+            txn_info.transaction_hash(),
+            txn_to_commit.transaction().hash()
         );
 
         // Fetch and verify transaction itself.
-        let txn = txn_to_commit.signed_txn();
+        let txn = txn_to_commit.transaction().as_signed_user_txn()?;
         let txn_with_proof = db.get_transaction_with_proof(cur_ver, ledger_version, true)?;
-        txn_with_proof.verify(ledger_info, cur_ver, txn.sender(), txn.sequence_number())?;
+        txn_with_proof.verify_user_txn(
+            ledger_info,
+            cur_ver,
+            txn.sender(),
+            txn.sequence_number(),
+        )?;
 
         let txn_with_proof = db
             .get_txn_by_account(txn.sender(), txn.sequence_number(), ledger_version, true)?
             .expect("Should exist.");
-        txn_with_proof.verify(ledger_info, cur_ver, txn.sender(), txn.sequence_number())?;
+        txn_with_proof.verify_user_txn(
+            ledger_info,
+            cur_ver,
+            txn.sender(),
+            txn.sequence_number(),
+        )?;
 
         let txn_list_with_proof =
             db.get_transactions(cur_ver, 1, ledger_version, true /* fetch_events */)?;

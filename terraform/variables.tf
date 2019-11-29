@@ -41,7 +41,41 @@ variable "image_tag" {
 
 variable "peer_ids" {
   type        = list(string)
-  description = "List of PeerIds"
+  description = "List of validator PeerIds"
+}
+
+variable "fullnode_ids" {
+  type        = list(string)
+  description = "List of full node PeerIds"
+}
+
+variable "validator_fullnode_id" {
+  type        = list(string)
+  description = "List of PeerId of the validator on the full node network"
+}
+
+variable "num_fullnodes" {
+  default     = 1
+  description = "Number of full nodes to run on validators"
+}
+
+variable "fullnode_distribution" {
+  type        = list(number)
+  default     = [1, 0, 0, 0]
+  description = "List of number of fullnodes on each validator"
+}
+
+# This is to generate a list of fullnode with validator index to indicate
+# which validator they should be connected to
+locals {
+  validator_index = range(0, length(var.fullnode_distribution))
+  fullnode_pair = zipmap(local.validator_index, var.fullnode_distribution)
+  expanded_fullnodes = {
+    for key, val in local.fullnode_pair : key => [
+      for i in range(val) : format("%d", key)
+    ]
+  }
+  fullnode_list = flatten(values(local.expanded_fullnodes))
 }
 
 variable "validator_type" {
@@ -88,8 +122,8 @@ variable "validator_node_sources_ipv6" {
 }
 
 variable "validator_use_public_ip" {
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "append_workspace_dns" {
@@ -105,4 +139,14 @@ variable "prometheus_pagerduty_key" {
 variable "monitoring_snapshot" {
   default     = ""
   description = "EBS snapshot ID to initialise monitoring data with"
+}
+
+variable "cloudwatch_logs" {
+  description = "Send container logs to CloudWatch"
+  default     = false
+}
+
+variable "monitoring_ebs_volume" {
+  default     = 100
+  description = "Size of monitoring instance EBS volume in GB"
 }

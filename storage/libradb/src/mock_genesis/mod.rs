@@ -4,29 +4,33 @@
 //! This module provides helpers to initialize [`LibraDB`] with fake generic state in tests.
 
 use crate::LibraDB;
-use crypto::{
+use failure::Result;
+use lazy_static::lazy_static;
+use libra_crypto::{
     ed25519::*,
     hash::{CryptoHash, ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID},
     HashValue,
 };
-use failure::Result;
-use lazy_static::lazy_static;
+use libra_types::block_info::BlockInfo;
+use libra_types::validator_set::ValidatorSet;
+use libra_types::{
+    account_address::AccountAddress,
+    account_state_blob::AccountStateBlob,
+    crypto_proxies::LedgerInfoWithSignatures,
+    ledger_info::LedgerInfo,
+    proof::SparseMerkleLeafNode,
+    transaction::{RawTransaction, Script, Transaction, TransactionInfo, TransactionToCommit},
+    vm_error::StatusCode,
+};
 use rand::{
     rngs::{OsRng, StdRng},
     Rng, SeedableRng,
 };
-use std::collections::HashMap;
-use types::{
-    account_address::AccountAddress,
-    account_state_blob::AccountStateBlob,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    proof::SparseMerkleLeafNode,
-    transaction::{Program, RawTransaction, TransactionInfo, TransactionToCommit},
-};
+use std::collections::{BTreeMap, HashMap};
 
 fn gen_mock_genesis() -> (
     TransactionInfo,
-    LedgerInfoWithSignatures<Ed25519Signature>,
+    LedgerInfoWithSignatures,
     TransactionToCommit,
 ) {
     let mut seed_rng = OsRng::new().expect("can't access OsRng");
@@ -34,19 +38,21 @@ fn gen_mock_genesis() -> (
     let mut rng = StdRng::from_seed(seed_buf);
     let (privkey, pubkey) = compat::generate_keypair(&mut rng);
     let some_addr = AccountAddress::from_public_key(&pubkey);
-    let raw_txn = RawTransaction::new(
+    let raw_txn = RawTransaction::new_script(
         some_addr,
         /* sequence_number = */ 0,
-        Program::new(vec![], vec![], vec![]),
+        Script::new(vec![], vec![]),
         /* max_gas_amount = */ 0,
         /* gas_unit_price = */ 0,
         /* expiration_time = */ std::time::Duration::new(0, 0),
     );
-    let signed_txn = raw_txn
-        .sign(&privkey, pubkey)
-        .expect("Signing failed.")
-        .into_inner();
-    let signed_txn_hash = signed_txn.hash();
+    let genesis_txn = Transaction::UserTransaction(
+        raw_txn
+            .sign(&privkey, pubkey)
+            .expect("Signing failed.")
+            .into_inner(),
+    );
+    let txn_hash = genesis_txn.hash();
 
     let some_blob = AccountStateBlob::from(vec![1u8]);
     let account_states = vec![(some_addr, some_blob.clone())]
@@ -54,32 +60,37 @@ fn gen_mock_genesis() -> (
         .collect::<HashMap<_, _>>();
 
     let txn_to_commit = TransactionToCommit::new(
-        signed_txn,
+        genesis_txn,
         account_states.clone(),
         vec![], /* events */
         0,      /* gas_used */
+        StatusCode::EXECUTED,
     );
 
     // The genesis state tree has a single leaf node, so the root hash is the hash of that node.
     let state_root_hash = SparseMerkleLeafNode::new(some_addr.hash(), some_blob.hash()).hash();
     let txn_info = TransactionInfo::new(
-        signed_txn_hash,
+        txn_hash,
         state_root_hash,
         *ACCUMULATOR_PLACEHOLDER_HASH,
         0,
+        StatusCode::EXECUTED,
     );
 
     let ledger_info = LedgerInfo::new(
-        0,
-        txn_info.hash(),
+        BlockInfo::new(
+            0,
+            0,
+            *GENESIS_BLOCK_ID,
+            txn_info.hash(),
+            0,
+            0,
+            Some(ValidatorSet::new(Vec::new())),
+        ),
         HashValue::random(),
-        *GENESIS_BLOCK_ID,
-        0,
-        0,
-        None,
     );
     let ledger_info_with_sigs =
-        LedgerInfoWithSignatures::new(ledger_info, HashMap::new() /* signatures */);
+        LedgerInfoWithSignatures::new(ledger_info, BTreeMap::new() /* signatures */);
 
     (txn_info, ledger_info_with_sigs, txn_to_commit)
 }
@@ -97,7 +108,7 @@ lazy_static! {
     /// other mocked information including validator signatures.
     pub static ref GENESIS_INFO: (
         TransactionInfo,
-        LedgerInfoWithSignatures<Ed25519Signature>,
+        LedgerInfoWithSignatures,
         TransactionToCommit
     ) = gen_mock_genesis();
 }

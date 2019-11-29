@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use crate::{
     access_path::AccessPath,
     account_address::AccountAddress,
@@ -8,26 +10,30 @@ use crate::{
     account_state_blob::AccountStateWithProof,
     contract_event::EventWithProof,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    proto::get_with_proof::{
+    proof::AccumulatorConsistencyProof,
+    proto::types::{
         GetAccountStateRequest, GetAccountStateResponse,
         GetAccountTransactionBySequenceNumberRequest,
         GetAccountTransactionBySequenceNumberResponse, GetEventsByEventAccessPathRequest,
         GetEventsByEventAccessPathResponse, GetTransactionsRequest, GetTransactionsResponse,
     },
-    transaction::{SignedTransactionWithProof, TransactionListWithProof, Version},
+    transaction::{TransactionListWithProof, TransactionWithProof, Version},
     validator_change::ValidatorChangeEventWithProof,
     validator_verifier::ValidatorVerifier,
 };
-use crypto::{hash::CryptoHash, *};
 use failure::prelude::*;
-#[cfg(any(test, feature = "testing"))]
+use libra_crypto::{hash::CryptoHash, *};
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto};
-use std::{cmp, mem, sync::Arc};
+use std::{
+    cmp,
+    convert::{TryFrom, TryInto},
+    mem,
+    sync::Arc,
+};
 
-#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[ProtoType(crate::proto::get_with_proof::UpdateToLatestLedgerRequest)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct UpdateToLatestLedgerRequest {
     pub client_known_version: u64,
     pub requested_items: Vec<RequestItem>,
@@ -42,41 +48,94 @@ impl UpdateToLatestLedgerRequest {
     }
 }
 
+impl TryFrom<crate::proto::types::UpdateToLatestLedgerRequest> for UpdateToLatestLedgerRequest {
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::types::UpdateToLatestLedgerRequest) -> Result<Self> {
+        Ok(Self {
+            client_known_version: proto.client_known_version,
+            requested_items: proto
+                .requested_items
+                .into_iter()
+                .map(TryFrom::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
+impl From<UpdateToLatestLedgerRequest> for crate::proto::types::UpdateToLatestLedgerRequest {
+    fn from(request: UpdateToLatestLedgerRequest) -> Self {
+        Self {
+            client_known_version: request.client_known_version,
+            requested_items: request
+                .requested_items
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateToLatestLedgerResponse<Sig> {
     pub response_items: Vec<ResponseItem>,
     pub ledger_info_with_sigs: LedgerInfoWithSignatures<Sig>,
-    pub validator_change_events: Vec<ValidatorChangeEventWithProof<Sig>>,
+    pub validator_change_events: ValidatorChangeEventWithProof<Sig>,
+    pub ledger_consistency_proof: AccumulatorConsistencyProof,
 }
 
-impl<Sig: Signature> IntoProto for UpdateToLatestLedgerResponse<Sig> {
-    type ProtoType = crate::proto::get_with_proof::UpdateToLatestLedgerResponse;
+impl<Sig: Signature> TryFrom<crate::proto::types::UpdateToLatestLedgerResponse>
+    for UpdateToLatestLedgerResponse<Sig>
+{
+    type Error = Error;
 
-    fn into_proto(self) -> Self::ProtoType {
-        let mut out = crate::proto::get_with_proof::UpdateToLatestLedgerResponse::new();
-        out.set_response_items(self.response_items.into_proto());
-        out.set_ledger_info_with_sigs(self.ledger_info_with_sigs.into_proto());
-        out.set_validator_change_events(self.validator_change_events.into_proto());
-        out
+    fn try_from(proto: crate::proto::types::UpdateToLatestLedgerResponse) -> Result<Self> {
+        let response_items = proto
+            .response_items
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>>>()?;
+        let ledger_info_with_sigs = proto
+            .ledger_info_with_sigs
+            .unwrap_or_else(Default::default)
+            .try_into()?;
+        let validator_change_events = proto
+            .validator_change_events
+            .unwrap_or_else(Default::default)
+            .try_into()?;
+        let ledger_consistency_proof = proto
+            .ledger_consistency_proof
+            .unwrap_or_else(Default::default)
+            .try_into()?;
+
+        Ok(Self {
+            response_items,
+            ledger_info_with_sigs,
+            validator_change_events,
+            ledger_consistency_proof,
+        })
     }
 }
 
-impl<Sig: Signature> FromProto for UpdateToLatestLedgerResponse<Sig> {
-    type ProtoType = crate::proto::get_with_proof::UpdateToLatestLedgerResponse;
+impl<Sig: Signature> From<UpdateToLatestLedgerResponse<Sig>>
+    for crate::proto::types::UpdateToLatestLedgerResponse
+{
+    fn from(response: UpdateToLatestLedgerResponse<Sig>) -> Self {
+        let response_items = response
+            .response_items
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let ledger_info_with_sigs = Some(response.ledger_info_with_sigs.into());
+        let validator_change_events = Some(response.validator_change_events.into());
+        let ledger_consistency_proof = Some(response.ledger_consistency_proof.into());
 
-    fn from_proto(mut object: Self::ProtoType) -> failure::Result<Self> {
-        Ok(UpdateToLatestLedgerResponse {
-            response_items: <Vec<ResponseItem> as FromProto>::from_proto(
-                object.take_response_items(),
-            )?,
-            ledger_info_with_sigs: LedgerInfoWithSignatures::from_proto(
-                object.take_ledger_info_with_sigs(),
-            )?,
-            validator_change_events:
-                <Vec<ValidatorChangeEventWithProof<Sig>> as FromProto>::from_proto(
-                    object.take_validator_change_events(),
-                )?,
-        })
+        Self {
+            response_items,
+            ledger_info_with_sigs,
+            validator_change_events,
+            ledger_consistency_proof,
+        }
     }
 }
 
@@ -85,12 +144,14 @@ impl<Sig: Signature> UpdateToLatestLedgerResponse<Sig> {
     pub fn new(
         response_items: Vec<ResponseItem>,
         ledger_info_with_sigs: LedgerInfoWithSignatures<Sig>,
-        validator_change_events: Vec<ValidatorChangeEventWithProof<Sig>>,
+        validator_change_events: ValidatorChangeEventWithProof<Sig>,
+        ledger_consistency_proof: AccumulatorConsistencyProof,
     ) -> Self {
         UpdateToLatestLedgerResponse {
             response_items,
             ledger_info_with_sigs,
             validator_change_events,
+            ledger_consistency_proof,
         }
     }
 
@@ -176,7 +237,7 @@ fn verify_response_item(
                 fetch_events,
             },
             ResponseItem::GetAccountTransactionBySequenceNumber {
-                signed_transaction_with_proof,
+                transaction_with_proof,
                 proof_of_current_sequence_number,
             },
         ) => verify_get_txn_by_seq_num_resp(
@@ -184,7 +245,7 @@ fn verify_response_item(
             *account,
             *sequence_number,
             *fetch_events,
-            signed_transaction_with_proof.as_ref(),
+            transaction_with_proof.as_ref(),
             proof_of_current_sequence_number.as_ref(),
         ),
         // GetEventsByEventAccessPath
@@ -239,20 +300,20 @@ fn verify_get_txn_by_seq_num_resp(
     req_account: AccountAddress,
     req_sequence_number: u64,
     req_fetch_events: bool,
-    signed_transaction_with_proof: Option<&SignedTransactionWithProof>,
+    transaction_with_proof: Option<&TransactionWithProof>,
     proof_of_current_sequence_number: Option<&AccountStateWithProof>,
 ) -> Result<()> {
-    match (signed_transaction_with_proof, proof_of_current_sequence_number) {
-        (Some(signed_transaction_with_proof), None) => {
+    match (transaction_with_proof, proof_of_current_sequence_number) {
+        (Some(transaction_with_proof), None) => {
             ensure!(
-                req_fetch_events == signed_transaction_with_proof.events.is_some(),
+                req_fetch_events == transaction_with_proof.events.is_some(),
                 "Bad GetAccountTxnBySeqNum response. Events requested: {}, events returned: {}.",
                 req_fetch_events,
-                signed_transaction_with_proof.events.is_some(),
+                transaction_with_proof.events.is_some(),
             );
-            signed_transaction_with_proof.verify(
+            transaction_with_proof.verify_user_txn(
                 ledger_info,
-                signed_transaction_with_proof.version,
+                transaction_with_proof.version,
                 req_account,
                 req_sequence_number,
             )
@@ -271,7 +332,7 @@ fn verify_get_txn_by_seq_num_resp(
         },
         _ => bail!(
             "Bad GetAccountTxnBySeqNum response. txn_proof.is_none():{}, cur_seq_num_proof.is_none():{}",
-            signed_transaction_with_proof.is_none(),
+            transaction_with_proof.is_none(),
             proof_of_current_sequence_number.is_none(),
         )
     }
@@ -347,21 +408,20 @@ fn verify_get_txns_resp(
     req_fetch_events: bool,
     txn_list_with_proof: &TransactionListWithProof,
 ) -> Result<()> {
-    ensure!(
-        req_fetch_events == txn_list_with_proof.events.is_some(),
-        "Bad GetTransactions response. Events requested: {}, events returned: {}.",
-        req_fetch_events,
-        txn_list_with_proof.events.is_some(),
-    );
-
     if req_limit == 0 || req_start_version > ledger_info.version() {
         txn_list_with_proof.verify(ledger_info, None)
     } else {
-        let num_txns = txn_list_with_proof.transaction_and_infos.len();
         ensure!(
-            cmp::min(req_limit, ledger_info.version() - req_start_version + 1)
-                == txn_list_with_proof.transaction_and_infos.len() as u64,
-            "Number of transactions returned not expected. num_txns: {}, start version: {}, latest version: {}",
+            req_fetch_events == txn_list_with_proof.events.is_some(),
+            "Bad GetTransactions response. Events requested: {}, events returned: {}.",
+            req_fetch_events,
+            txn_list_with_proof.events.is_some(),
+        );
+        let num_txns = txn_list_with_proof.transactions.len();
+        ensure!(
+            cmp::min(req_limit, ledger_info.version() - req_start_version + 1) == num_txns as u64,
+            "Number of transactions returned not expected. num_txns: {}, start version: {}, \
+             latest version: {}",
             num_txns,
             req_start_version,
             ledger_info.version(),
@@ -371,7 +431,7 @@ fn verify_get_txns_resp(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub enum RequestItem {
     GetAccountTransactionBySequenceNumber {
         account: AccountAddress,
@@ -395,116 +455,122 @@ pub enum RequestItem {
     },
 }
 
-impl FromProto for RequestItem {
-    type ProtoType = crate::proto::get_with_proof::RequestItem;
+impl TryFrom<crate::proto::types::RequestItem> for RequestItem {
+    type Error = Error;
 
-    fn from_proto(mut object: Self::ProtoType) -> Result<Self> {
-        Ok(if object.has_get_account_state_request() {
-            let address =
-                AccountAddress::from_proto(object.take_get_account_state_request().take_address())?;
-            RequestItem::GetAccountState { address }
-        } else if object.has_get_account_transaction_by_sequence_number_request() {
-            let mut req = object.take_get_account_transaction_by_sequence_number_request();
-            let account = AccountAddress::from_proto(req.take_account())?;
-            let sequence_number = req.get_sequence_number();
-            let fetch_events = req.get_fetch_events();
+    fn try_from(proto: crate::proto::types::RequestItem) -> Result<Self> {
+        use crate::proto::types::request_item::RequestedItems::*;
 
-            RequestItem::GetAccountTransactionBySequenceNumber {
-                account,
-                sequence_number,
-                fetch_events,
+        let item = proto
+            .requested_items
+            .ok_or_else(|| format_err!("Missing requested_items"))?;
+
+        let request = match item {
+            GetAccountStateRequest(request) => {
+                let address = AccountAddress::try_from(request.address)?;
+                RequestItem::GetAccountState { address }
             }
-        } else if object.has_get_events_by_event_access_path_request() {
-            let mut req = object.take_get_events_by_event_access_path_request();
+            GetAccountTransactionBySequenceNumberRequest(request) => {
+                let account = AccountAddress::try_from(request.account)?;
+                let sequence_number = request.sequence_number;
+                let fetch_events = request.fetch_events;
 
-            let access_path = AccessPath::from_proto(req.take_access_path())?;
-            let start_event_seq_num = req.get_start_event_seq_num();
-            let ascending = req.get_ascending();
-            let limit = req.get_limit();
-
-            RequestItem::GetEventsByEventAccessPath {
-                access_path,
-                start_event_seq_num,
-                ascending,
-                limit,
+                RequestItem::GetAccountTransactionBySequenceNumber {
+                    account,
+                    sequence_number,
+                    fetch_events,
+                }
             }
-        } else if object.has_get_transactions_request() {
-            let req = object.get_get_transactions_request();
-            let start_version = req.get_start_version();
-            let limit = req.get_limit();
-            let fetch_events = req.get_fetch_events();
+            GetEventsByEventAccessPathRequest(request) => {
+                let access_path = request
+                    .access_path
+                    .ok_or_else(|| format_err!("Missing access_path"))?
+                    .try_into()?;
+                let start_event_seq_num = request.start_event_seq_num;
+                let ascending = request.ascending;
+                let limit = request.limit;
 
-            RequestItem::GetTransactions {
-                start_version,
-                limit,
-                fetch_events,
+                RequestItem::GetEventsByEventAccessPath {
+                    access_path,
+                    start_event_seq_num,
+                    ascending,
+                    limit,
+                }
             }
-        } else {
-            bail!("Unknown RequestItem type.")
-        })
+            GetTransactionsRequest(request) => {
+                let start_version = request.start_version;
+                let limit = request.limit;
+                let fetch_events = request.fetch_events;
+
+                RequestItem::GetTransactions {
+                    start_version,
+                    limit,
+                    fetch_events,
+                }
+            }
+        };
+
+        Ok(request)
     }
 }
 
-impl IntoProto for RequestItem {
-    type ProtoType = crate::proto::get_with_proof::RequestItem;
+impl From<RequestItem> for crate::proto::types::RequestItem {
+    fn from(request: RequestItem) -> Self {
+        use crate::proto::types::request_item::RequestedItems;
 
-    fn into_proto(self) -> Self::ProtoType {
-        let mut out = Self::ProtoType::new();
-        match self {
+        let req = match request {
             RequestItem::GetAccountState { address } => {
-                let mut req = GetAccountStateRequest::new();
-                req.set_address(address.into_proto());
-                out.set_get_account_state_request(req);
+                RequestedItems::GetAccountStateRequest(GetAccountStateRequest {
+                    address: address.into(),
+                })
             }
             RequestItem::GetAccountTransactionBySequenceNumber {
                 account,
                 sequence_number,
                 fetch_events,
-            } => {
-                let mut req = GetAccountTransactionBySequenceNumberRequest::new();
-                req.set_account(account.into_proto());
-                req.set_sequence_number(sequence_number);
-                req.set_fetch_events(fetch_events);
-
-                out.set_get_account_transaction_by_sequence_number_request(req);
-            }
+            } => RequestedItems::GetAccountTransactionBySequenceNumberRequest(
+                GetAccountTransactionBySequenceNumberRequest {
+                    account: account.into(),
+                    sequence_number,
+                    fetch_events,
+                },
+            ),
             RequestItem::GetEventsByEventAccessPath {
                 access_path,
                 start_event_seq_num,
                 ascending,
                 limit,
-            } => {
-                let mut req = GetEventsByEventAccessPathRequest::new();
-                req.set_access_path(access_path.into_proto());
-                req.set_start_event_seq_num(start_event_seq_num);
-                req.set_ascending(ascending);
-                req.set_limit(limit);
-
-                out.set_get_events_by_event_access_path_request(req);
-            }
+            } => RequestedItems::GetEventsByEventAccessPathRequest(
+                GetEventsByEventAccessPathRequest {
+                    access_path: Some(access_path.into()),
+                    start_event_seq_num,
+                    ascending,
+                    limit,
+                },
+            ),
             RequestItem::GetTransactions {
                 start_version,
                 limit,
                 fetch_events,
-            } => {
-                let mut req = GetTransactionsRequest::new();
-                req.set_start_version(start_version);
-                req.set_limit(limit);
-                req.set_fetch_events(fetch_events);
+            } => RequestedItems::GetTransactionsRequest(GetTransactionsRequest {
+                start_version,
+                limit,
+                fetch_events,
+            }),
+        };
 
-                out.set_get_transactions_request(req);
-            }
+        Self {
+            requested_items: Some(req),
         }
-        out
     }
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub enum ResponseItem {
     GetAccountTransactionBySequenceNumber {
-        signed_transaction_with_proof: Option<SignedTransactionWithProof>,
+        transaction_with_proof: Option<TransactionWithProof>,
         proof_of_current_sequence_number: Option<AccountStateWithProof>,
     },
     // this can't be the first variant, tracked here https://github.com/AltSysrq/proptest/issues/141
@@ -533,18 +599,12 @@ impl ResponseItem {
 
     pub fn into_get_account_txn_by_seq_num_response(
         self,
-    ) -> Result<(
-        Option<SignedTransactionWithProof>,
-        Option<AccountStateWithProof>,
-    )> {
+    ) -> Result<(Option<TransactionWithProof>, Option<AccountStateWithProof>)> {
         match self {
             ResponseItem::GetAccountTransactionBySequenceNumber {
-                signed_transaction_with_proof,
+                transaction_with_proof,
                 proof_of_current_sequence_number,
-            } => Ok((
-                signed_transaction_with_proof,
-                proof_of_current_sequence_number,
-            )),
+            } => Ok((transaction_with_proof, proof_of_current_sequence_number)),
             _ => bail!("Not ResponseItem::GetAccountTransactionBySequenceNumber."),
         }
     }
@@ -571,120 +631,111 @@ impl ResponseItem {
     }
 }
 
-impl FromProto for ResponseItem {
-    type ProtoType = crate::proto::get_with_proof::ResponseItem;
+impl TryFrom<crate::proto::types::ResponseItem> for ResponseItem {
+    type Error = Error;
 
-    fn from_proto(mut object: Self::ProtoType) -> Result<Self> {
-        Ok(if object.has_get_account_state_response() {
-            let account_state_with_proof = AccountStateWithProof::from_proto(
-                object
-                    .take_get_account_state_response()
-                    .take_account_state_with_proof(),
-            )?;
+    fn try_from(proto: crate::proto::types::ResponseItem) -> Result<Self> {
+        use crate::proto::types::response_item::ResponseItems::*;
 
-            ResponseItem::GetAccountState {
-                account_state_with_proof,
+        let item = proto
+            .response_items
+            .ok_or_else(|| format_err!("Missing response_items"))?;
+
+        let response = match item {
+            GetAccountStateResponse(response) => {
+                let account_state_with_proof = response
+                    .account_state_with_proof
+                    .ok_or_else(|| format_err!("Missing account_state_with_proof"))?
+                    .try_into()?;
+                ResponseItem::GetAccountState {
+                    account_state_with_proof,
+                }
             }
-        } else if object.has_get_account_transaction_by_sequence_number_response() {
-            let mut res = object.take_get_account_transaction_by_sequence_number_response();
-            let signed_transaction_with_proof = res
-                .signed_transaction_with_proof
-                .take()
-                .map(SignedTransactionWithProof::from_proto)
-                .transpose()?;
-            let proof_of_current_sequence_number = res
-                .proof_of_current_sequence_number
-                .take()
-                .map(AccountStateWithProof::from_proto)
-                .transpose()?;
+            GetAccountTransactionBySequenceNumberResponse(response) => {
+                let transaction_with_proof = response
+                    .transaction_with_proof
+                    .map(TryInto::try_into)
+                    .transpose()?;
+                let proof_of_current_sequence_number = response
+                    .proof_of_current_sequence_number
+                    .map(TryInto::try_into)
+                    .transpose()?;
 
-            ResponseItem::GetAccountTransactionBySequenceNumber {
-                signed_transaction_with_proof,
-                proof_of_current_sequence_number,
+                ResponseItem::GetAccountTransactionBySequenceNumber {
+                    transaction_with_proof,
+                    proof_of_current_sequence_number,
+                }
             }
-        } else if object.has_get_events_by_event_access_path_response() {
-            let mut res = object.take_get_events_by_event_access_path_response();
+            GetEventsByEventAccessPathResponse(response) => {
+                let events_with_proof = response
+                    .events_with_proof
+                    .into_iter()
+                    .map(TryFrom::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                let proof_of_latest_event = response
+                    .proof_of_latest_event
+                    .ok_or_else(|| format_err!("Missing proof_of_latest_event"))?
+                    .try_into()?;
 
-            let events_with_proof = res
-                .take_events_with_proof()
-                .into_iter()
-                .map(EventWithProof::from_proto)
-                .collect::<Result<Vec<_>>>()?;
-
-            let proof_of_latest_event =
-                AccountStateWithProof::from_proto(res.take_proof_of_latest_event())?;
-
-            ResponseItem::GetEventsByEventAccessPath {
-                events_with_proof,
-                proof_of_latest_event,
+                ResponseItem::GetEventsByEventAccessPath {
+                    events_with_proof,
+                    proof_of_latest_event,
+                }
             }
-        } else if object.has_get_transactions_response() {
-            let mut res = object.take_get_transactions_response();
-            let txn_list_with_proof =
-                TransactionListWithProof::from_proto(res.take_txn_list_with_proof())?;
+            GetTransactionsResponse(response) => {
+                let txn_list_with_proof = response
+                    .txn_list_with_proof
+                    .ok_or_else(|| format_err!("Missing txn_list_with_proof"))?
+                    .try_into()?;
 
-            ResponseItem::GetTransactions {
-                txn_list_with_proof,
+                ResponseItem::GetTransactions {
+                    txn_list_with_proof,
+                }
             }
-        } else {
-            bail!("Unknown ResponseItem type.")
-        })
+        };
+
+        Ok(response)
     }
 }
 
-impl IntoProto for ResponseItem {
-    type ProtoType = crate::proto::get_with_proof::ResponseItem;
+impl From<ResponseItem> for crate::proto::types::ResponseItem {
+    fn from(response: ResponseItem) -> Self {
+        use crate::proto::types::response_item::ResponseItems;
 
-    fn into_proto(self) -> Self::ProtoType {
-        let mut out = Self::ProtoType::new();
-        match self {
+        let res = match response {
             ResponseItem::GetAccountState {
                 account_state_with_proof,
-            } => {
-                let mut res = GetAccountStateResponse::new();
-                res.set_account_state_with_proof(account_state_with_proof.into_proto());
-
-                out.set_get_account_state_response(res);
-            }
+            } => ResponseItems::GetAccountStateResponse(GetAccountStateResponse {
+                account_state_with_proof: Some(account_state_with_proof.into()),
+            }),
             ResponseItem::GetAccountTransactionBySequenceNumber {
-                signed_transaction_with_proof,
+                transaction_with_proof,
                 proof_of_current_sequence_number,
-            } => {
-                let mut res = GetAccountTransactionBySequenceNumberResponse::new();
-
-                if let Some(t) = signed_transaction_with_proof {
-                    res.set_signed_transaction_with_proof(t.into_proto())
-                }
-                if let Some(p) = proof_of_current_sequence_number {
-                    res.set_proof_of_current_sequence_number(p.into_proto())
-                }
-
-                out.set_get_account_transaction_by_sequence_number_response(res);
-            }
+            } => ResponseItems::GetAccountTransactionBySequenceNumberResponse(
+                GetAccountTransactionBySequenceNumberResponse {
+                    transaction_with_proof: transaction_with_proof.map(Into::into),
+                    proof_of_current_sequence_number: proof_of_current_sequence_number
+                        .map(Into::into),
+                },
+            ),
             ResponseItem::GetEventsByEventAccessPath {
                 events_with_proof,
                 proof_of_latest_event,
-            } => {
-                let mut res = GetEventsByEventAccessPathResponse::new();
-                res.set_events_with_proof(::protobuf::RepeatedField::from_vec(
-                    events_with_proof
-                        .into_iter()
-                        .map(EventWithProof::into_proto)
-                        .collect(),
-                ));
-                res.set_proof_of_latest_event(proof_of_latest_event.into_proto());
-
-                out.set_get_events_by_event_access_path_response(res);
-            }
+            } => ResponseItems::GetEventsByEventAccessPathResponse(
+                GetEventsByEventAccessPathResponse {
+                    events_with_proof: events_with_proof.into_iter().map(Into::into).collect(),
+                    proof_of_latest_event: Some(proof_of_latest_event.into()),
+                },
+            ),
             ResponseItem::GetTransactions {
                 txn_list_with_proof,
-            } => {
-                let mut res = GetTransactionsResponse::new();
-                res.set_txn_list_with_proof(txn_list_with_proof.into_proto());
+            } => ResponseItems::GetTransactionsResponse(GetTransactionsResponse {
+                txn_list_with_proof: Some(txn_list_with_proof.into()),
+            }),
+        };
 
-                out.set_get_transactions_response(res)
-            }
+        Self {
+            response_items: Some(res),
         }
-        out
     }
 }

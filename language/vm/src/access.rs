@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! Defines accessors for compiled modules.
 
 use crate::{
@@ -15,7 +17,7 @@ use crate::{
     internals::ModuleIndex,
     vm_string::{VMStr, VMString},
 };
-use types::{
+use libra_types::{
     account_address::AccountAddress,
     byte_array::ByteArray,
     identifier::{IdentStr, Identifier},

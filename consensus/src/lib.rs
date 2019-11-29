@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! Consensus for the Libra Core blockchain
 //!
 //! Encapsulates public consensus traits and any implementations of those traits.
@@ -8,7 +10,7 @@
 //! [HotStuff](https://arxiv.org/pdf/1803.05069.pdf)).
 
 #![cfg_attr(not(feature = "fuzzing"), deny(missing_docs))]
-#![feature(async_await)]
+#![cfg_attr(feature = "fuzzing", allow(dead_code))]
 #![recursion_limit = "512"]
 extern crate failure;
 
@@ -16,15 +18,15 @@ extern crate failure;
 #[macro_use]
 extern crate debug_interface;
 
-#[cfg(not(feature = "fuzzing"))]
-mod chained_bft;
-#[cfg(feature = "fuzzing")]
-pub mod chained_bft;
+#[macro_use]
+extern crate prometheus;
 
-#[cfg(not(any(test, feature = "fuzzing")))]
+mod chained_bft;
+
 mod util;
-#[cfg(any(test, feature = "fuzzing"))]
-pub mod util;
+
+#[cfg(feature = "fuzzing")]
+pub use chained_bft::event_processor_fuzzing;
 
 /// Defines the public consensus provider traits to implement for
 /// use in the Libra Core blockchain.
