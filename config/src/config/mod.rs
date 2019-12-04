@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use failure::prelude::*;
+use anyhow::{ensure, Result};
 use libra_types::PeerId;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -110,6 +110,25 @@ impl BaseConfig {
             file_path.clone()
         }
     }
+
+    /// Returns true if the default is set, the current file path is empty, and the default file
+    /// path points to an existing file.
+    pub fn test_and_set_full_path<T>(
+        &self,
+        config_value: &T,
+        default_value: &T,
+        config_path: &mut PathBuf,
+        default_path: &str,
+    ) where
+        T: PartialEq,
+    {
+        if *config_path != PathBuf::new() || config_value != default_value {
+            return;
+        }
+        if self.full_path(&PathBuf::from(default_path)).is_file() {
+            config_path.push(default_path);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -213,7 +232,7 @@ impl NodeConfig {
     /// post-processing of the config
     /// Paths used in the config are either absolute or relative to the config location
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut config = Self::load_config(&path);
+        let mut config = Self::load_config(&path)?;
         if config.base.role.is_validator() {
             ensure!(
                 config.validator_network.is_some(),
@@ -314,20 +333,16 @@ impl NodeConfig {
 }
 
 pub trait PersistableConfig: Serialize + DeserializeOwned {
-    // TODO: Return Result<Self> instead of panic.
-    fn load_config<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref();
-        let mut file =
-            File::open(path).unwrap_or_else(|_| panic!("Cannot open config file {:?}", path));
+    fn load_config<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut file = File::open(&path)?;
         let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .unwrap_or_else(|_| panic!("Error reading config file {:?}", path));
-        Self::parse(&contents).expect("Unable to parse config")
+        file.read_to_string(&mut contents)?;
+        Self::parse(&contents)
     }
 
     fn save_config<P: AsRef<Path>>(&self, output_file: P) {
         let contents = toml::to_vec(&self).expect("Error serializing");
-        let mut file = File::create(output_file).expect("Error opening file");
+        let mut file = File::create(output_file).expect("Error creating file");
         file.write_all(&contents).expect("Error writing file");
     }
 
@@ -342,16 +357,16 @@ impl<T: ?Sized> PersistableConfig for T where T: Serialize + DeserializeOwned {}
 mod test {
     use super::*;
 
-    static EXPECTED_SINGLE_NODE_CONFIG: &[u8] =
-        include_bytes!("../../data/configs/single.node.config.toml");
+    const DEFAULT: &str = "data/configs/single.node.config.toml";
+    const RANDOM_DEFAULT: &str = "data/configs/random.default.node.config.toml";
+    const RANDOM_COMPLETE: &str = "data/configs/random.complete.node.config.toml";
 
     #[test]
-    fn verify_test_config() {
+    fn verify_default_config() {
         // This test likely failed because there was a breaking change in the NodeConfig. It may be
         // desirable to reverse the change or to change the test config and potentially documentation.
         let mut actual = NodeConfig::random();
-        let mut expected = NodeConfig::parse(&String::from_utf8_lossy(EXPECTED_SINGLE_NODE_CONFIG))
-            .expect("Error parsing expected single node config");
+        let mut expected = NodeConfig::load(DEFAULT).expect("Unable to load config");
 
         // These are randomly generated, so let's force them to be the same, perhaps we can use a
         // random seed so that these can be made uniform...
@@ -376,6 +391,42 @@ mod test {
         expected_network.network_peers = actual_network.network_peers.clone();
         expected_network.seed_peers = actual_network.seed_peers.clone();
 
+        compare_configs(&actual, &expected);
+    }
+
+    #[test]
+    fn verify_random_complete_config() {
+        let mut rng = StdRng::from_seed([255u8; 32]);
+        let mut expected = NodeConfig::random_with_rng(&mut rng);
+        // Required to update paths
+        expected.save(&PathBuf::from("node.config.toml"));
+
+        let actual = NodeConfig::load(RANDOM_COMPLETE).expect("Unable to load config");
+        // This is randomly generated, so make them consistent, loading has already occurred
+        expected
+            .set_data_dir(actual.base.data_dir.clone())
+            .expect("Unable to set data_dir");
+
+        compare_configs(&actual, &expected);
+    }
+
+    #[test]
+    fn verify_random_default_config() {
+        let mut rng = StdRng::from_seed([255u8; 32]);
+        let mut expected = NodeConfig::random_with_rng(&mut rng);
+        // Required to update paths
+        expected.save(&PathBuf::from("node.config.toml"));
+
+        let actual = NodeConfig::load(RANDOM_DEFAULT).expect("Unable to load config");
+        // This is randomly generated, so make them consistent, loading has already occurred
+        expected
+            .set_data_dir(actual.base.data_dir.clone())
+            .expect("Unable to set data_dir");
+
+        compare_configs(&actual, &expected);
+    }
+
+    fn compare_configs(actual: &NodeConfig, expected: &NodeConfig) {
         // This is broken down first into smaller evaluations to improve idenitfying what is broken.
         // The output for a broken config leveraging assert at the top level config is not readable.
         assert_eq!(actual.admission_control, expected.admission_control);
@@ -398,15 +449,47 @@ mod test {
 
     #[test]
     fn verify_all_configs() {
+        // First test well defined configs
         let _ = vec![
-            PathBuf::from("data/configs/overrides/persistent_data.node.config.override.toml"),
-            PathBuf::from("data/configs/single.node.config.toml"),
-            PathBuf::from("../terraform/validator-sets/100/fn/node.config.toml"),
-            PathBuf::from("../terraform/validator-sets/100/val/node.config.toml"),
-            PathBuf::from("../terraform/validator-sets/dev/fn/node.config.toml"),
-            PathBuf::from("../terraform/validator-sets/dev/val/node.config.toml"),
+            // This contains all the default fields written to disk, it verifies that the default
+            // is consistent and can be loaded without failure
+            DEFAULT,
+            // This config leverages default fields but uses the same PeerId and secondary files as
+            // the random.complete.node.config.toml. It verifies the assumptions about loading
+            // files even if the paths aren't present
+            RANDOM_DEFAULT,
+            // This config explicitly writes all the default values for a random peer to disk and
+            // verifies that it correctly loads. It shares the same PeerId as
+            // random.default.node.config.toml
+            RANDOM_COMPLETE,
         ]
         .iter()
-        .map(|path| NodeConfig::load(path).expect("NodeConfig"));
+        .map(|path| {
+            NodeConfig::load(PathBuf::from(path)).unwrap_or_else(|_| panic!("Error in {}", path))
+        })
+        .collect::<Vec<_>>();
+
+        // Now test configs that require some additional manipulation
+        let _ = vec![
+            "../terraform/validator-sets/100/fn/node.config.toml",
+            "../terraform/validator-sets/100/val/node.config.toml",
+            "../terraform/validator-sets/dev/fn/node.config.toml",
+            "../terraform/validator-sets/dev/val/node.config.toml",
+        ]
+        .iter()
+        .map(|path| {
+            let mut file =
+                File::open(&path).unwrap_or_else(|_| panic!("Unable to open file: {}", path));
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .unwrap_or_else(|_| panic!("Unable to read file: {}", path));
+            let new_contents = contents
+                .replace("${peer_id}", &PeerId::default().to_string())
+                .replace("${fullnode_id}", &PeerId::default().to_string())
+                .replace("${upstream_peer}", &PeerId::default().to_string())
+                .replace("${self_ip}", "0.0.0.0");
+            NodeConfig::parse(&new_contents).unwrap_or_else(|_| panic!("Error in {}", path));
+        })
+        .collect::<Vec<_>>();
     }
 }

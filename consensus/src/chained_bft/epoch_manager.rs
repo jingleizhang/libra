@@ -35,7 +35,7 @@ pub struct EpochManager<T> {
     epoch: u64,
     config: ChainedBftSMRConfig,
     time_service: Arc<ClockTimeService>,
-    self_sender: channel::Sender<failure::Result<Event<ConsensusMsg>>>,
+    self_sender: channel::Sender<anyhow::Result<Event<ConsensusMsg>>>,
     network_sender: ConsensusNetworkSender,
     timeout_sender: channel::Sender<Round>,
     txn_manager: Arc<dyn TxnManager<Payload = T>>,
@@ -51,7 +51,7 @@ impl<T: Payload> EpochManager<T> {
         epoch: u64,
         config: ChainedBftSMRConfig,
         time_service: Arc<ClockTimeService>,
-        self_sender: channel::Sender<failure::Result<Event<ConsensusMsg>>>,
+        self_sender: channel::Sender<anyhow::Result<Event<ConsensusMsg>>>,
         network_sender: ConsensusNetworkSender,
         timeout_sender: channel::Sender<Round>,
         txn_manager: Arc<dyn TxnManager<Payload = T>>,
@@ -174,7 +174,7 @@ impl<T: Payload> EpochManager<T> {
     }
 
     pub fn start_epoch(
-        &self,
+        &mut self,
         signer: Arc<ValidatorSigner>,
         initial_data: RecoveryData<T>,
     ) -> EventProcessor<T> {
@@ -188,6 +188,11 @@ impl<T: Payload> EpochManager<T> {
             initial_data.root_block(),
             validators,
         );
+        block_on(
+            self.network_sender
+                .update_eligible_nodes(initial_data.validator_keys()),
+        )
+        .expect("Unable to update network's eligible peers");
         let last_vote = initial_data.last_vote();
         let author = signer.author();
         let safety_rules_storage = match &self.config.safety_rules.backend {

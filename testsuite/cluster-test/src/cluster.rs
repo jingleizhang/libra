@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{aws::Aws, instance::Instance};
-use failure::{self, prelude::*};
+use anyhow::{ensure, format_err, Result};
 use libra_config::config::AdmissionControlConfig;
 use rand::prelude::*;
 use rusoto_ec2::{DescribeInstancesRequest, Ec2, Filter, Tag};
@@ -39,7 +39,7 @@ impl Cluster {
         }
     }
 
-    pub fn discover(aws: &Aws, mint_file: &str) -> failure::Result<Self> {
+    pub fn discover(aws: &Aws, mint_file: &str) -> Result<Self> {
         let mut instances = vec![];
         let mut next_token = None;
         let mut retries_left = 10;
@@ -48,7 +48,7 @@ impl Cluster {
             let filters = vec![
                 Filter {
                     name: Some("tag:Workspace".into()),
-                    values: Some(vec![aws.workplace().clone()]),
+                    values: Some(vec![aws.workspace().clone()]),
                 },
                 Filter {
                     name: Some("instance-state-name".into()),
@@ -110,7 +110,7 @@ impl Cluster {
             "No instances were discovered for cluster"
         );
         let prometheus_ip =
-            prometheus_ip.ok_or_else(|| format_err!("Prometheus was not found in workplace"))?;
+            prometheus_ip.ok_or_else(|| format_err!("Prometheus was not found in workspace"))?;
         Ok(Self {
             instances,
             prometheus_ip: Some(prometheus_ip),

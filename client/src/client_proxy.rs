@@ -3,7 +3,7 @@
 
 use crate::{commands::*, grpc_client::GRPCClient, AccountData, AccountStatus};
 use admission_control_proto::proto::admission_control::SubmitTransactionRequest;
-use failure::prelude::*;
+use anyhow::{bail, ensure, format_err, Error, Result};
 use libra_config::config::{ConsensusPeersConfig, PersistableConfig};
 use libra_crypto::{ed25519::*, test_utils::KeyPair};
 use libra_logger::prelude::*;
@@ -114,7 +114,7 @@ impl ClientProxy {
         mnemonic_file: Option<String>,
     ) -> Result<Self> {
         let validator_verifier = Arc::new(
-            ConsensusPeersConfig::load_config(validator_set_file).get_validator_verifier(),
+            ConsensusPeersConfig::load_config(validator_set_file)?.get_validator_verifier(),
         );
         ensure!(
             !validator_verifier.is_empty(),

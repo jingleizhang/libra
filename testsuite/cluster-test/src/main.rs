@@ -18,6 +18,7 @@ use slog_scope::{info, warn};
 use structopt::{clap::ArgGroup, StructOpt};
 use termion::{color, style};
 
+use anyhow::{bail, format_err, Result};
 use cluster_test::effects::RemoveNetworkEffects;
 use cluster_test::experiments::{get_experiment, Context};
 use cluster_test::github::GitHub;
@@ -38,10 +39,6 @@ use cluster_test::{
     suite::ExperimentSuite,
     tx_emitter::TxEmitter,
 };
-use failure::{
-    self,
-    prelude::{bail, format_err},
-};
 use futures::future::join_all;
 use futures::future::FutureExt;
 use futures::future::TryFutureExt;
@@ -53,8 +50,6 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(StructOpt, Debug)]
 #[structopt(group = ArgGroup::with_name("action").required(true))]
 struct Args {
-    #[structopt(short = "w", long, conflicts_with = "swarm")]
-    workplace: Option<String>,
     #[structopt(short = "p", long, use_delimiter = true)]
     peers: Vec<String>,
 
@@ -212,7 +207,7 @@ pub fn main() {
     }
 }
 
-fn exit_on_error<T>(r: failure::Result<T>) -> T {
+fn exit_on_error<T>(r: Result<T>) -> T {
     match r {
         Ok(r) => r,
         Err(err) => {
@@ -260,7 +255,7 @@ struct ClusterTestRunner {
     github: GitHub,
 }
 
-fn parse_host_port(s: &str) -> failure::Result<(String, u32)> {
+fn parse_host_port(s: &str) -> Result<(String, u32)> {
     let v = s.split(':').collect::<Vec<&str>>();
     if v.len() != 2 {
         return Err(format_err!("Failed to parse {:?} in host:port format", s));
@@ -300,12 +295,7 @@ impl BasicSwarmUtil {
 
 impl ClusterUtil {
     pub fn setup(args: &Args) -> Self {
-        let aws = Aws::new(
-            args.workplace
-                .as_ref()
-                .expect("--workplace not set")
-                .clone(),
-        );
+        let aws = Aws::new();
         let cluster = Cluster::discover(&aws, &args.mint_file).expect("Failed to discover cluster");
         let cluster = if args.peers.is_empty() {
             cluster
@@ -317,7 +307,11 @@ impl ClusterUtil {
                 .prometheus_ip()
                 .expect("Failed to discover prometheus ip in aws"),
         );
-        info!("Discovered {} peers", cluster.instances().len());
+        info!(
+            "Discovered {} peers in {} workspace",
+            cluster.instances().len(),
+            aws.workspace()
+        );
         Self {
             cluster,
             aws,
@@ -422,7 +416,7 @@ impl ClusterTestRunner {
         }
     }
 
-    pub fn run_ci_suite(&mut self, hash_to_tag: Option<String>) -> failure::Result<()> {
+    pub fn run_ci_suite(&mut self, hash_to_tag: Option<String>) -> Result<()> {
         let suite = ExperimentSuite::new_pre_release(&self.cluster);
         let results = self.run_suite(suite)?;
         let output = results
@@ -463,16 +457,16 @@ impl ClusterTestRunner {
         self.cleanup();
         loop {
             let hash = self.wait_for_new_tag();
-            let upstream_tag = self
+            let master_tag = self
                 .deployment_manager
-                .get_upstream_tag(&hash)
+                .get_master_tag(&hash)
                 .unwrap_or_else(|e| {
                     warn!("Failed to get upstream tag for {}: {}", hash, e);
                     "<unknown tag>".to_string()
                 });
             info!(
                 "New version of `{}` tag({}) is available: `{}`",
-                SOURCE_TAG, upstream_tag, hash
+                SOURCE_TAG, master_tag, hash
             );
             match self.redeploy(&hash) {
                 Err(e) => {
@@ -536,7 +530,7 @@ impl ClusterTestRunner {
         self.slack_message(msg);
     }
 
-    fn redeploy(&mut self, hash: &str) -> failure::Result<()> {
+    fn redeploy(&mut self, hash: &str) -> Result<()> {
         info!("Cleaning up before deploy");
         self.cleanup();
         info!("Stopping validators");
@@ -549,7 +543,7 @@ impl ClusterTestRunner {
         }
         let marker = self
             .deployment_manager
-            .get_upstream_tag(hash)
+            .get_master_tag(hash)
             .map_err(|e| format_err!("Failed to get upstream tag: {}", e))?;
         self.fetch_genesis(&marker)?;
         self.deployment_manager.redeploy(hash.to_string())?;
@@ -563,7 +557,7 @@ impl ClusterTestRunner {
         Ok(())
     }
 
-    fn fetch_genesis(&mut self, marker: &str) -> failure::Result<()> {
+    fn fetch_genesis(&mut self, marker: &str) -> Result<()> {
         let cmd = format!(
             "sudo aws s3 cp s3://toro-validator-sets/{}/100/genesis.blob /opt/libra/genesis.blob",
             marker
@@ -583,7 +577,7 @@ impl ClusterTestRunner {
         Ok(())
     }
 
-    fn run_suite(&mut self, suite: ExperimentSuite) -> failure::Result<Vec<Option<String>>> {
+    fn run_suite(&mut self, suite: ExperimentSuite) -> Result<Vec<Option<String>>> {
         info!("Starting suite");
         let mut results = vec![];
         let suite_started = Instant::now();
@@ -612,10 +606,7 @@ impl ClusterTestRunner {
         println!("Performance report:\n```\n{}\n```", output);
     }
 
-    pub fn cleanup_and_run(
-        &mut self,
-        experiment: Box<dyn Experiment>,
-    ) -> failure::Result<Option<String>> {
+    pub fn cleanup_and_run(&mut self, experiment: Box<dyn Experiment>) -> Result<Option<String>> {
         self.cleanup();
         self.run_single_experiment(experiment)
     }
@@ -623,7 +614,7 @@ impl ClusterTestRunner {
     pub fn run_single_experiment(
         &mut self,
         mut experiment: Box<dyn Experiment>,
-    ) -> failure::Result<Option<String>> {
+    ) -> Result<Option<String>> {
         let events = self.logs.recv_all();
         if let Err(s) =
             self.health_check_runner
@@ -793,7 +784,7 @@ impl ClusterTestRunner {
         }
     }
 
-    fn wait_until_all_healthy(&mut self) -> failure::Result<()> {
+    fn wait_until_all_healthy(&mut self) -> Result<()> {
         let wait_deadline = Instant::now() + Duration::from_secs(20 * 60);
         for instance in self.cluster.instances() {
             self.health_check_runner.invalidate(instance.short_hash());

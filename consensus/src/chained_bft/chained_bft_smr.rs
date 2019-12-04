@@ -14,9 +14,9 @@ use crate::{
     state_replication::{StateComputer, StateMachineReplication, TxnManager},
     util::time_service::ClockTimeService,
 };
+use anyhow::Result;
 use channel;
 use consensus_types::common::{Payload, Round};
-use failure::prelude::*;
 use futures::{select, stream::StreamExt};
 use libra_config::config::{ConsensusConfig, ConsensusProposerType, SafetyRulesConfig};
 use libra_logger::prelude::*;
@@ -184,7 +184,7 @@ impl<T: Payload> StateMachineReplication for ChainedBftSMR<T> {
         let signer = Arc::new(initial_setup.signer);
         let epoch = initial_data.epoch();
         let validators = initial_data.validators();
-        let epoch_mgr = EpochManager::new(
+        let mut epoch_mgr = EpochManager::new(
             epoch,
             self.config.take().expect("already started, config is None"),
             time_service,
