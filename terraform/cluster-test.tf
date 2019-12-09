@@ -19,10 +19,6 @@ data "aws_iam_policy_document" "cluster-test-runner" {
     actions   = ["ecs:*"]
     resources = ["arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:service/${terraform.workspace}/*"]
   }
-  statement {
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = ["${aws_secretsmanager_secret.faucet.arn}"]
-  }
 }
 
 resource "aws_iam_role_policy" "cluster-test-runner" {
@@ -110,6 +106,15 @@ resource "aws_security_group_rule" "cluster-test-debug-port-validator" {
   type                     = "ingress"
   from_port                = 6191
   to_port                  = 6191
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.cluster-test-host.id
+}
+
+resource "aws_security_group_rule" "cluster-test-metrics-port-validator" {
+  security_group_id        = aws_security_group.validator.id
+  type                     = "ingress"
+  from_port                = 9101
+  to_port                  = 9101
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.cluster-test-host.id
 }

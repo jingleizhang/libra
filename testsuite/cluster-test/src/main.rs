@@ -30,7 +30,7 @@ use cluster_test::util::unix_timestamp_now;
 use cluster_test::{
     aws::Aws,
     cluster::Cluster,
-    deployment::{DeploymentManager, SOURCE_TAG},
+    deployment::DeploymentManager,
     effects::{Action, Effect, Reboot, StopContainer},
     experiments::Experiment,
     health::{DebugPortLogThread, HealthCheckRunner, LogTail},
@@ -48,7 +48,7 @@ use tokio::runtime::Runtime;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(StructOpt, Debug)]
-#[structopt(group = ArgGroup::with_name("action").required(true))]
+#[structopt(group = ArgGroup::with_name("action"))]
 struct Args {
     #[structopt(short = "p", long, use_delimiter = true)]
     peers: Vec<String>,
@@ -66,7 +66,7 @@ struct Args {
     #[structopt(long, group = "action")]
     pssh: bool,
     #[structopt(long, group = "action")]
-    run: bool,
+    run: Option<String>,
     #[structopt(long, group = "action")]
     tail_logs: bool,
     #[structopt(long, group = "action")]
@@ -88,17 +88,15 @@ struct Args {
     #[structopt(long, group = "action")]
     cleanup: bool,
     #[structopt(long, group = "action")]
-    changelog: Option<String>,
-    #[structopt(long, group = "action")]
     run_ci_suite: bool,
-    #[structopt(long, group = "action")]
-    run_experiment: Option<String>,
 
     #[structopt(last = true)]
     last: Vec<String>,
 
     #[structopt(long)]
     deploy: Option<String>,
+    #[structopt(long, multiple = true)]
+    changelog: Option<Vec<String>>,
 
     // emit_tx options
     #[structopt(long, default_value = "10")]
@@ -159,10 +157,11 @@ pub fn main() {
         exit_on_error(runner.redeploy(&hash));
     }
 
-    if args.run {
-        runner.run_suite_in_loop();
-    } else if args.tail_logs {
+    let mut perf_msg = None;
+
+    if args.tail_logs {
         runner.tail_logs();
+        return;
     } else if args.health_check {
         runner.run_health_check();
     } else if args.wipe_all_db {
@@ -178,22 +177,14 @@ pub fn main() {
     } else if args.start {
         runner.start();
     } else if args.perf_run {
-        runner.perf_run();
+        perf_msg = Some(runner.perf_run());
     } else if args.stop_experiment {
         runner.stop_experiment(args.max_stopped);
     } else if args.cleanup {
         runner.cleanup();
-    } else if let Some(commit) = args.changelog {
-        let prev_commit = runner
-            .deployment_manager
-            .get_tested_upstream_commit()
-            .map_err(|e| warn!("Failed to get prev_commit: {:?}", e))
-            .ok();
-        println!("Prev commit: {:?}", prev_commit);
-        println!("{}", runner.get_changelog(prev_commit.as_ref(), &commit));
     } else if args.run_ci_suite {
-        exit_on_error(runner.run_ci_suite(args.deploy));
-    } else if let Some(experiment_name) = args.run_experiment {
+        perf_msg = Some(exit_on_error(runner.run_ci_suite()));
+    } else if let Some(experiment_name) = args.run {
         runner
             .cleanup_and_run(get_experiment(
                 &experiment_name,
@@ -201,9 +192,25 @@ pub fn main() {
                 &runner.cluster,
             ))
             .unwrap();
-    } else {
-        // Arg parser should prevent this from happening since action group is required
-        unreachable!()
+    } else if args.changelog.is_none() && args.deploy.is_none() {
+        println!("No action specified");
+        process::exit(1);
+    }
+
+    if let Some(mut changelog) = args.changelog {
+        if changelog.len() != 2 {
+            println!("Use: changelog <from> <to>");
+            process::exit(1);
+        }
+        let to_commit = changelog.remove(1);
+        let from_commit = Some(changelog.remove(0));
+        if let Some(perf_msg) = perf_msg {
+            runner.send_changelog_message(&perf_msg, &from_commit, &to_commit);
+        } else {
+            println!("{}", runner.get_changelog(from_commit.as_ref(), &to_commit));
+        }
+    } else if let Some(perf_msg) = perf_msg {
+        println!("{}", perf_msg);
     }
 }
 
@@ -248,7 +255,6 @@ struct ClusterTestRunner {
     experiment_interval: Duration,
     runtime: Runtime,
     slack: SlackClient,
-    slack_log_url: Option<Url>,
     slack_changelog_url: Option<Url>,
     tx_emitter: TxEmitter,
     prometheus: Prometheus,
@@ -386,9 +392,6 @@ impl ClusterTestRunner {
         let experiment_interval = Duration::from_secs(experiment_interval_sec);
         let deployment_manager = DeploymentManager::new(aws.clone(), cluster.clone());
         let slack = SlackClient::new();
-        let slack_log_url = env::var("SLACK_LOG_URL")
-            .map(|u| u.parse().expect("Failed to parse SLACK_LOG_URL"))
-            .ok();
         let slack_changelog_url = env::var("SLACK_CHANGELOG_URL")
             .map(|u| u.parse().expect("Failed to parse SLACK_CHANGELOG_URL"))
             .ok();
@@ -408,7 +411,6 @@ impl ClusterTestRunner {
             experiment_interval,
             slack,
             runtime,
-            slack_log_url,
             slack_changelog_url,
             tx_emitter,
             prometheus,
@@ -416,7 +418,7 @@ impl ClusterTestRunner {
         }
     }
 
-    pub fn run_ci_suite(&mut self, hash_to_tag: Option<String>) -> Result<()> {
+    pub fn run_ci_suite(&mut self) -> Result<String> {
         let suite = ExperimentSuite::new_pre_release(&self.cluster);
         let results = self.run_suite(suite)?;
         let output = results
@@ -425,77 +427,21 @@ impl ClusterTestRunner {
             .map(|x| x.as_ref().unwrap())
             .join("\n");
         let perf_msg = format!("Performance report:\n```\n{}\n```", output);
-        if let Some(hash_to_tag) = hash_to_tag {
-            info!("Test suite succeed first time for `{}`", hash_to_tag);
-            let prev_commit = self
-                .deployment_manager
-                .get_tested_upstream_commit()
-                .map_err(|e| warn!("Failed to get prev_commit: {}", e))
-                .ok();
-            let upstream_commit = match self
-                .deployment_manager
-                .tag_tested_image(hash_to_tag.clone())
-            {
-                Err(e) => {
-                    return Err(format_err!("Failed to tag tested image: {}", e));
-                }
-                Ok(upstream_commit) => upstream_commit,
-            };
-            info!(
-                "prev_commit: {:?}, upstream_commit: {}",
-                prev_commit, upstream_commit
-            );
-            let changelog = self.get_changelog(prev_commit.as_ref(), &upstream_commit);
-            self.slack_changelog_message(format!("{}\n\n{}", changelog, perf_msg));
-        } else {
-            println!("{}", perf_msg);
-        }
-        Ok(())
+        Ok(perf_msg)
     }
 
-    pub fn run_suite_in_loop(&mut self) {
-        self.cleanup();
-        loop {
-            let hash = self.wait_for_new_tag();
-            let master_tag = self
-                .deployment_manager
-                .get_master_tag(&hash)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to get upstream tag for {}: {}", hash, e);
-                    "<unknown tag>".to_string()
-                });
-            info!(
-                "New version of `{}` tag({}) is available: `{}`",
-                SOURCE_TAG, master_tag, hash
-            );
-            match self.redeploy(&hash) {
-                Err(e) => {
-                    self.report_failure(format!("Failed to deploy `{}`: {}", hash, e));
-                    return;
-                }
-                Ok(()) => {
-                    info!("Deployed new version `{}`, running test suite", hash);
-                }
-            }
-            if let Err(e) = self.run_ci_suite(Some(hash)) {
-                self.report_failure(format!("{}", e));
-                return;
-            }
-        }
-    }
-
-    fn wait_for_new_tag(&self) -> String {
-        let mut first = true;
-        loop {
-            if let Some(hash) = self.deployment_manager.latest_hash_changed() {
-                return hash;
-            }
-            if first {
-                info!("Last deployed digest matches latest digest we expect, not doing redeploy");
-                first = false;
-            }
-            thread::sleep(Duration::from_secs(60));
-        }
+    pub fn send_changelog_message(
+        &self,
+        perf_msg: &str,
+        from_commit: &Option<String>,
+        to_commit: &str,
+    ) {
+        info!(
+            "Generating changelog from {:?} to {}",
+            from_commit, to_commit
+        );
+        let changelog = self.get_changelog(from_commit.as_ref(), &to_commit);
+        self.slack_changelog_message(format!("{}\n\n{}", changelog, perf_msg));
     }
 
     fn get_changelog(&self, prev_commit: Option<&String>, upstream_commit: &str) -> String {
@@ -524,10 +470,6 @@ impl ClusterTestRunner {
                 msg
             }
         }
-    }
-
-    fn report_failure(&self, msg: String) {
-        self.slack_message(msg);
     }
 
     fn redeploy(&mut self, hash: &str) -> Result<()> {
@@ -595,15 +537,14 @@ impl ClusterTestRunner {
         Ok(results)
     }
 
-    pub fn perf_run(&mut self) {
+    pub fn perf_run(&mut self) -> String {
         let suite = ExperimentSuite::new_perf_suite(&self.cluster);
         let results = self.run_suite(suite).unwrap();
-        let output = results
+        results
             .iter()
             .filter(|x| x.is_some())
             .map(|x| x.as_ref().unwrap())
-            .join("\n");
-        println!("Performance report:\n```\n{}\n```", output);
+            .join("\n")
     }
 
     pub fn cleanup_and_run(&mut self, experiment: Box<dyn Experiment>) -> Result<Option<String>> {
@@ -714,7 +655,7 @@ impl ClusterTestRunner {
         Ok(retval)
     }
 
-    pub fn stop_experiment(mut self, max_stopped: usize) {
+    pub fn stop_experiment(&mut self, max_stopped: usize) {
         let mut instances = self.cluster.instances().to_vec();
         let mut rng = ThreadRng::default();
         let mut stop_effects = vec![];
@@ -814,15 +755,6 @@ impl ClusterTestRunner {
         }
     }
 
-    fn slack_message(&self, msg: String) {
-        info!("{}", msg);
-        if let Some(ref log_url) = self.slack_log_url {
-            if let Err(e) = self.slack.send_message(log_url, &msg) {
-                info!("Failed to send slack message: {}", e);
-            }
-        }
-    }
-
     fn slack_changelog_message(&self, msg: String) {
         info!("{}", msg);
         if let Some(ref changelog_url) = self.slack_changelog_url {
@@ -877,7 +809,7 @@ impl ClusterTestRunner {
             .ok();
     }
 
-    fn reboot(mut self) {
+    fn reboot(&mut self) {
         let futures = self.cluster.instances().iter().map(|instance| {
             async move {
                 let reboot = Reboot::new(instance.clone());

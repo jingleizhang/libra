@@ -6,7 +6,7 @@
 mod genesis_gas_schedule;
 
 use crate::genesis_gas_schedule::initial_gas_schedule;
-use failure::prelude::*;
+use anyhow::Result;
 use lazy_static::lazy_static;
 use libra_crypto::{ed25519::*, traits::ValidKey};
 use libra_state_view::StateView;
@@ -15,11 +15,11 @@ use libra_types::{
     account_address::AccountAddress,
     account_config,
     byte_array::ByteArray,
+    crypto_proxies::ValidatorSet,
     identifier::Identifier,
     transaction::{
         ChangeSet, RawTransaction, Script, SignatureCheckedTransaction, TransactionArgument,
     },
-    validator_set::ValidatorSet,
 };
 use rand::{rngs::StdRng, SeedableRng};
 use std::time::Duration;

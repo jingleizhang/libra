@@ -4,11 +4,11 @@
 // The config holds the options that define the testing environment.
 // A config entry starts with "//!", differentiating it from a directive.
 
-use crate::{config::strip, errors::*, genesis_accounts::make_genesis_accounts};
+use crate::{common::strip, errors::*, genesis_accounts::make_genesis_accounts};
 use language_e2e_tests::account::{Account, AccountData};
 use libra_config::generator;
 use libra_crypto::PrivateKey;
-use libra_types::validator_set::ValidatorSet;
+use libra_types::crypto_proxies::ValidatorSet;
 use std::{
     collections::{btree_map, BTreeMap},
     str::FromStr,

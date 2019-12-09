@@ -108,11 +108,20 @@ impl NetworkSender {
             .await?;
         counters::BLOCK_RETRIEVAL_DURATION_S.observe_duration(pre_retrieval_instant.elapsed());
         let response = BlockRetrievalResponse::<T>::try_from(response_msg)?;
-        response.verify(
-            retrieval_request.block_id(),
-            retrieval_request.num_blocks(),
-            self.validators.as_ref(),
-        )?;
+        response
+            .verify(
+                retrieval_request.block_id(),
+                retrieval_request.num_blocks(),
+                self.validators.as_ref(),
+            )
+            .map_err(|e| {
+                security_log(SecurityEvent::InvalidRetrievedBlock)
+                    .error(&e)
+                    .data(&response)
+                    .log();
+                e
+            })?;
+
         Ok(response)
     }
 
@@ -145,11 +154,12 @@ impl NetworkSender {
             error!("Error broadcasting to self: {:?}", err);
         }
 
-        // Get the list of validators excluding our own account address.
+        // Get the list of validators excluding our own account address. Note the
+        // ordering is not important in this case.
         let self_author = self.author;
         let other_validators = self
             .validators
-            .get_account_addresses_iter()
+            .get_ordered_account_addresses_iter()
             .filter(|author| author != &self_author);
 
         // Broadcast message over direct-send to all other validators.
