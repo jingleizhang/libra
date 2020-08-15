@@ -1,119 +1,156 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{config::BaseConfig, utils};
-use anyhow::Result;
+use crate::config::{Error, RootPath, SecureBackend};
 use libra_types::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
+    net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
 };
 
 const GENESIS_DEFAULT: &str = "genesis.blob";
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionConfig {
-    pub address: String,
-    pub port: u16,
     #[serde(skip)]
     pub genesis: Option<Transaction>,
+    pub sign_vote_proposal: bool,
     pub genesis_file_location: PathBuf,
-    #[serde(skip)]
-    pub base: Arc<BaseConfig>,
+    pub service: ExecutionCorrectnessService,
+    pub backend: SecureBackend,
+    pub network_timeout_ms: u64,
+}
+
+impl std::fmt::Debug for ExecutionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ExecutionConfig {{ genesis: ")?;
+        if self.genesis.is_some() {
+            write!(f, "Some(...)")?;
+        } else {
+            write!(f, "None")?;
+        }
+        write!(
+            f,
+            ", genesis_file_location: {:?} ",
+            self.genesis_file_location
+        )?;
+        write!(
+            f,
+            ", sign_vote_proposal: {:?}, service: {:?}, backend: {:?} }}",
+            self.sign_vote_proposal, self.service, self.backend
+        )?;
+        self.service.fmt(f)
+    }
 }
 
 impl Default for ExecutionConfig {
     fn default() -> ExecutionConfig {
         ExecutionConfig {
-            address: "localhost".to_string(),
-            port: 6183,
             genesis: None,
             genesis_file_location: PathBuf::new(),
-            base: Arc::new(BaseConfig::default()),
+            service: ExecutionCorrectnessService::Thread,
+            backend: SecureBackend::InMemoryStorage,
+            sign_vote_proposal: true,
+            // Default value of 30 seconds for the network timeout.
+            network_timeout_ms: 30_000,
         }
     }
 }
 
 impl ExecutionConfig {
-    pub fn prepare(&mut self, base: Arc<BaseConfig>) {
-        self.base = base;
-    }
-
-    pub fn load(&mut self) -> Result<()> {
-        // By default genesis_file_location is empty so that load can always succeed from an empty
-        // slate. At the same time, configs typically store genesis at this location, so make the
-        // config somewhat flexible by allowing genesis.blob to be filled in by default if and only
-        // if the file exists on disk and the genesis blob is None.
-        self.base.test_and_set_full_path(
-            &self.genesis,
-            &None,
-            &mut self.genesis_file_location,
-            GENESIS_DEFAULT,
-        );
-
+    pub fn load(&mut self, root_dir: &RootPath) -> Result<(), Error> {
         if !self.genesis_file_location.as_os_str().is_empty() {
-            let mut file = File::open(&self.genesis_file_location())?;
+            let path = root_dir.full_path(&self.genesis_file_location);
+            let mut file = File::open(&path).map_err(|e| Error::IO("genesis".into(), e))?;
             let mut buffer = vec![];
-            file.read_to_end(&mut buffer)?;
-            // TODO: update to use `Transaction::WriteSet` variant when ready.
-            self.genesis = Some(lcs::from_bytes(&buffer)?);
+            file.read_to_end(&mut buffer)
+                .map_err(|e| Error::IO("genesis".into(), e))?;
+            let data = lcs::from_bytes(&buffer).map_err(|e| Error::LCS("genesis", e))?;
+            self.genesis = Some(data);
         }
 
         Ok(())
     }
 
-    pub fn save(&mut self) {
+    pub fn save(&mut self, root_dir: &RootPath) -> Result<(), Error> {
         if let Some(genesis) = &self.genesis {
             if self.genesis_file_location.as_os_str().is_empty() {
                 self.genesis_file_location = PathBuf::from(GENESIS_DEFAULT);
             }
-            let mut file =
-                File::create(self.genesis_file_location()).expect("Unable to create genesis.blob");
-            file.write_all(&lcs::to_bytes(&genesis).expect("Unable to serialize genesis"))
-                .expect("Unable to write genesis");
+            let path = root_dir.full_path(&self.genesis_file_location);
+            let mut file = File::create(&path).map_err(|e| Error::IO("genesis".into(), e))?;
+            let data = lcs::to_bytes(&genesis).map_err(|e| Error::LCS("genesis", e))?;
+            file.write_all(&data)
+                .map_err(|e| Error::IO("genesis".into(), e))?;
+        }
+        Ok(())
+    }
+
+    pub fn set_data_dir(&mut self, data_dir: PathBuf) {
+        if let SecureBackend::OnDiskStorage(backend) = &mut self.backend {
+            backend.set_data_dir(data_dir);
         }
     }
+}
 
-    pub fn genesis_file_location(&self) -> PathBuf {
-        self.base.full_path(&self.genesis_file_location)
-    }
+/// Defines how execution correctness should be run
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ExecutionCorrectnessService {
+    /// This runs execution correctness in the same thread as event processor.
+    Local,
+    /// This is the production, separate service approach
+    Process(RemoteExecutionService),
+    /// This runs safety rules in the same thread as event processor but data is passed through the
+    /// light weight RPC (serializer)
+    Serializer,
+    /// This creates a separate thread to run execution correctness, it is similar to a fork / exec style
+    Thread,
+}
 
-    pub fn randomize_ports(&mut self) {
-        self.port = utils::get_available_port();
-    }
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteExecutionService {
+    pub server_address: SocketAddr,
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::config::RoleType;
-    use libra_tools::tempdir::TempPath;
-    use libra_types::{transaction::Transaction, write_set::WriteSetMut};
+    use libra_temppath::TempPath;
+    use libra_types::{
+        transaction::{ChangeSet, Transaction, WriteSetPayload},
+        write_set::WriteSetMut,
+    };
 
     #[test]
     fn test_no_genesis() {
-        let (mut config, _path) = generate_config();
+        let (mut config, path) = generate_config();
         assert_eq!(config.genesis, None);
-        let result = config.load();
+        let root_dir = RootPath::new_path(path.path());
+        let result = config.load(&root_dir);
         assert!(result.is_ok());
         assert_eq!(config.genesis_file_location, PathBuf::new());
     }
 
     #[test]
-    fn test_some_and_default_genesis() {
-        let fake_genesis = Transaction::WriteSet(WriteSetMut::new(vec![]).freeze().unwrap());
-        let (mut config, _path) = generate_config();
+    fn test_some_and_load_genesis() {
+        let fake_genesis = Transaction::GenesisTransaction(WriteSetPayload::Direct(
+            ChangeSet::new(WriteSetMut::new(vec![]).freeze().unwrap(), vec![]),
+        ));
+        let (mut config, path) = generate_config();
         config.genesis = Some(fake_genesis.clone());
-        config.save();
+        let root_dir = RootPath::new_path(path.path());
+        config.save(&root_dir).expect("Unable to save");
         // Verifies some without path
         assert_eq!(config.genesis_file_location, PathBuf::from(GENESIS_DEFAULT));
 
         config.genesis = None;
-        let result = config.load();
+        let result = config.load(&root_dir);
         assert!(result.is_ok());
         assert_eq!(config.genesis, Some(fake_genesis));
     }
@@ -121,9 +158,7 @@ mod test {
     fn generate_config() -> (ExecutionConfig, TempPath) {
         let temp_dir = TempPath::new();
         temp_dir.create_as_dir().expect("error creating tempdir");
-        let base_config = BaseConfig::new(temp_dir.path().into(), RoleType::Validator);
-        let mut execution_config = ExecutionConfig::default();
-        execution_config.base = Arc::new(base_config);
+        let execution_config = ExecutionConfig::default();
         (execution_config, temp_dir)
     }
 }

@@ -5,13 +5,16 @@
 //! meant to be triggered by other threads as they commit new data to the DB.
 
 use crate::{
+    metrics::{
+        LIBRA_STORAGE_OTHER_TIMERS_SECONDS, LIBRA_STORAGE_PRUNER_LEAST_READABLE_STATE_VERSION,
+    },
     schema::{
         jellyfish_merkle_node::JellyfishMerkleNodeSchema, stale_node_index::StaleNodeIndexSchema,
     },
     OP_COUNTER,
 };
 use anyhow::Result;
-use jellyfish_merkle::StaleNodeIndex;
+use libra_jellyfish_merkle::StaleNodeIndex;
 use libra_logger::prelude::*;
 use libra_types::transaction::Version;
 use schemadb::{ReadOptions, SchemaBatch, SchemaIterator, DB};
@@ -19,15 +22,13 @@ use schemadb::{ReadOptions, SchemaBatch, SchemaIterator, DB};
 use std::thread::sleep;
 use std::{
     iter::Peekable,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
-};
-use std::{
     sync::{
+        atomic::{AtomicU64, Ordering},
         mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
     },
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 /// The `Pruner` is meant to be part of a `LibraDB` instance and runs in the background to prune old
@@ -35,10 +36,11 @@ use std::{
 ///
 /// It creates a worker thread on construction and joins it on destruction. When destructed, it
 /// quits the worker thread eagerly without waiting for all pending work to be done.
+#[derive(Debug)]
 pub(crate) struct Pruner {
     /// Other than the latest version, how many historical versions to keep being readable. For
     /// example, this being 0 means keep only the latest version.
-    num_historical_versions_to_keep: u64,
+    historical_versions_to_keep: u64,
     /// The worker thread handle, created upon Pruner instance construction and joined upon its
     /// destruction. It only becomes `None` after joined in `drop()`.
     worker_thread: Option<JoinHandle<()>>,
@@ -52,7 +54,7 @@ pub(crate) struct Pruner {
 
 impl Pruner {
     /// Creates a worker thread that waits on a channel for pruning commands.
-    pub fn new(db: Arc<DB>, num_historical_versions_to_keep: u64) -> Self {
+    pub fn new(db: Arc<DB>, historical_versions_to_keep: u64) -> Self {
         let (command_sender, command_receiver) = channel();
         let worker_progress = Arc::new(AtomicU64::new(0));
         let worker_progress_clone = Arc::clone(&worker_progress);
@@ -63,7 +65,7 @@ impl Pruner {
             .expect("Creating pruner thread should succeed.");
 
         Self {
-            num_historical_versions_to_keep,
+            historical_versions_to_keep,
             worker_thread: Some(worker_thread),
             command_sender: Mutex::new(command_sender),
             worker_progress,
@@ -72,8 +74,8 @@ impl Pruner {
 
     /// Sends pruning command to the worker thread when necessary.
     pub fn wake(&self, latest_version: Version) {
-        if latest_version > self.num_historical_versions_to_keep {
-            let least_readable_version = latest_version - self.num_historical_versions_to_keep;
+        if latest_version > self.historical_versions_to_keep {
+            let least_readable_version = latest_version - self.historical_versions_to_keep;
             self.command_sender
                 .lock()
                 .expect("command_sender to pruner thread should lock.")
@@ -90,8 +92,8 @@ impl Pruner {
     pub fn wake_and_wait(&self, latest_version: Version) -> Result<()> {
         self.wake(latest_version);
 
-        if latest_version > self.num_historical_versions_to_keep {
-            let least_readable_version = latest_version - self.num_historical_versions_to_keep;
+        if latest_version > self.historical_versions_to_keep {
+            let least_readable_version = latest_version - self.historical_versions_to_keep;
             // Assuming no big pruning chunks will be issued by a test.
             const TIMEOUT: Duration = Duration::from_secs(10);
             let end = Instant::now() + TIMEOUT;
@@ -184,6 +186,8 @@ impl Worker {
                         "pruner.least_readable_state_version",
                         least_readable_version as usize,
                     );
+                    LIBRA_STORAGE_PRUNER_LEAST_READABLE_STATE_VERSION
+                        .set(least_readable_version as i64);
 
                     // Try to purge the log.
                     if let Err(e) = self.maybe_purge_index() {
@@ -344,6 +348,9 @@ pub fn prune_state(
     if indices.is_empty() {
         Ok(least_readable_version)
     } else {
+        let _timer = LIBRA_STORAGE_OTHER_TIMERS_SECONDS
+            .with_label_values(&["pruner_commit"])
+            .start_timer();
         let new_least_readable_version = indices.last().expect("Should exist.").stale_since_version;
         let mut batch = SchemaBatch::new();
         indices

@@ -1,13 +1,12 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Module {
+    #[serde(with = "serde_bytes")]
     code: Vec<u8>,
 }
 
@@ -18,10 +17,6 @@ impl Module {
 
     pub fn code(&self) -> &[u8] {
         &self.code
-    }
-
-    pub fn into_inner(self) -> Vec<u8> {
-        self.code
     }
 }
 

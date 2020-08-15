@@ -8,10 +8,10 @@ use crate::effects::Effect;
 /// If no instances are provided, network delay is introduced on all outgoing packets
 use crate::instance::Instance;
 use anyhow::Result;
-use futures::future::{BoxFuture, FutureExt};
-use slog_scope::info;
-use std::fmt;
-use std::time::Duration;
+
+use async_trait::async_trait;
+use libra_logger::debug;
+use std::{fmt, time::Duration};
 
 pub struct NetworkDelay {
     instance: Instance,
@@ -29,17 +29,17 @@ impl NetworkDelay {
     }
 }
 
+#[async_trait]
 impl Effect for NetworkDelay {
-    fn activate(&self) -> BoxFuture<Result<()>> {
-        info!("Injecting NetworkDelays for {}", self.instance);
+    async fn activate(&mut self) -> Result<()> {
+        debug!("Injecting NetworkDelays for {}", self.instance);
         let mut command = "".to_string();
-        command += "sudo tc qdisc delete dev eth0 root; ";
         // Create a HTB https://linux.die.net/man/8/tc-htb
-        command += "sudo tc qdisc add dev eth0 root handle 1: htb; ";
+        command += "tc qdisc add dev eth0 root handle 1: htb; ";
         for i in 0..self.configuration.len() {
             // Create a class within the HTB https://linux.die.net/man/8/tc
             command += format!(
-                "sudo tc class add dev eth0 parent 1: classid 1:{} htb rate 1tbit; ",
+                "tc class add dev eth0 parent 1: classid 1:{} htb rate 1tbit; ",
                 i + 1
             )
             .as_str();
@@ -48,26 +48,26 @@ impl Effect for NetworkDelay {
             // Create u32 filters so that all the target instances are classified as class 1:(i+1)
             // http://man7.org/linux/man-pages/man8/tc-u32.8.html
             for target_instance in &self.configuration[i].0 {
-                command += format!("sudo tc filter add dev eth0 parent 1: protocol ip prio 1 u32 flowid 1:{} match ip dst {}; ", i+1, target_instance.ip()).as_str();
+                command += format!("tc filter add dev eth0 parent 1: protocol ip prio 1 u32 flowid 1:{} match ip dst {}; ", i+1, target_instance.ip()).as_str();
             }
         }
         for i in 0..self.configuration.len() {
             // Use netem to delay packets to this class
             command += format!(
-                "sudo tc qdisc add dev eth0 parent 1:{} handle {}0: netem delay {}ms; ",
+                "tc qdisc add dev eth0 parent 1:{} handle {}0: netem delay {}ms; ",
                 i + 1,
                 i + 1,
                 self.configuration[i].1.as_millis(),
             )
             .as_str();
         }
-        self.instance.run_cmd(vec![command]).boxed()
+        self.instance.util_cmd(command, "ac-net-delay").await
     }
 
-    fn deactivate(&self) -> BoxFuture<Result<()>> {
+    async fn deactivate(&mut self) -> Result<()> {
         self.instance
-            .run_cmd(vec!["sudo tc qdisc delete dev eth0 root; true".to_string()])
-            .boxed()
+            .util_cmd("tc qdisc delete dev eth0 root; true", "de-net-delay")
+            .await
     }
 }
 

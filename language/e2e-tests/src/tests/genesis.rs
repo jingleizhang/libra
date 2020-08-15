@@ -2,38 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    assert_prologue_parity, assert_status_eq, executor::FakeExecutor, transaction_status_eq,
+    account::AccountData, common_transactions::peer_to_peer_txn, data_store::GENESIS_CHANGE_SET,
+    executor::FakeExecutor,
 };
-use libra_crypto::ed25519::*;
-use libra_types::{
-    access_path::AccessPath,
-    account_config,
-    test_helpers::transaction_test_helpers,
-    transaction::TransactionStatus,
-    vm_error::StatusCode,
-    vm_error::VMStatus,
-    write_set::{WriteOp, WriteSetMut},
-};
+use libra_types::transaction::{Transaction, TransactionStatus, WriteSetPayload};
 
 #[test]
-fn invalid_genesis_write_set() {
+fn no_deletion_in_genesis() {
+    let genesis = GENESIS_CHANGE_SET.clone();
+    assert!(!genesis.write_set().iter().any(|(_, op)| op.is_deletion()))
+}
+
+#[test]
+fn execute_genesis_write_set() {
     let executor = FakeExecutor::no_genesis();
-    // Genesis write sets are not allowed to contain deletions.
-    let write_op = (AccessPath::default(), WriteOp::Deletion);
-    let write_set = WriteSetMut::new(vec![write_op]).freeze().unwrap();
-    let address = account_config::association_address();
-    let (private_key, public_key) = compat::generate_keypair(None);
-    let txn = transaction_test_helpers::get_write_set_txn(
-        address,
-        0,
-        private_key,
-        public_key,
-        Some(write_set),
-    )
-    .into_inner();
-    assert_prologue_parity!(
-        executor.verify_transaction(txn.clone()),
-        executor.execute_transaction(txn).status(),
-        VMStatus::new(StatusCode::INVALID_WRITE_SET)
-    );
+    let txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(GENESIS_CHANGE_SET.clone()));
+    let mut output = executor.execute_transaction_block(vec![txn]).unwrap();
+
+    // Executing the genesis transaction should succeed
+    assert_eq!(output.len(), 1);
+    assert!(!output.pop().unwrap().status().is_discarded())
+}
+
+#[test]
+fn execute_genesis_and_drop_other_transaction() {
+    let executor = FakeExecutor::no_genesis();
+    let txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(GENESIS_CHANGE_SET.clone()));
+
+    let sender = AccountData::new(1_000_000, 10);
+    let receiver = AccountData::new(100_000, 10);
+    let txn2 = peer_to_peer_txn(&sender.account(), &receiver.account(), 11, 1000);
+
+    let mut output = executor
+        .execute_transaction_block(vec![txn, Transaction::UserTransaction(txn2)])
+        .unwrap();
+
+    // Transaction that comes after genesis should be dropped.
+    assert_eq!(output.len(), 2);
+    assert_eq!(output.pop().unwrap().status(), &TransactionStatus::Retry)
 }

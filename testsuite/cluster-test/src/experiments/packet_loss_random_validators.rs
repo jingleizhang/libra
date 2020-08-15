@@ -8,12 +8,12 @@
 /// in the cluster after the given duration
 use crate::{
     cluster::Cluster,
-    effects::{Action, PacketLoss, RemoveNetworkEffects},
-    experiments::{Context, Experiment},
+    effects::{self, packet_loss::PacketLoss},
+    experiments::{Context, Experiment, ExperimentParam},
     instance::Instance,
 };
-use anyhow::Result;
-use futures::future::{BoxFuture, FutureExt};
+
+use async_trait::async_trait;
 use std::{fmt, time::Duration};
 use structopt::StructOpt;
 
@@ -22,7 +22,6 @@ pub struct PacketLossRandomValidators {
     percent: f32,
     duration: Duration,
 }
-use crate::experiments::ExperimentParam;
 use tokio::time;
 
 #[derive(StructOpt, Debug)]
@@ -50,37 +49,33 @@ pub struct PacketLossRandomValidatorsParams {
 impl ExperimentParam for PacketLossRandomValidatorsParams {
     type E = PacketLossRandomValidators;
     fn build(self, cluster: &Cluster) -> Self::E {
-        let total_instances = cluster.instances().len();
+        let total_instances = cluster.validator_instances().len();
         let packet_loss_num_instances: usize = std::cmp::min(
             ((self.percent_instances / 100.0) * total_instances as f32).ceil() as usize,
             total_instances,
         );
-        let (test_cluster, _) = cluster.split_n_random(packet_loss_num_instances);
+        let (test_cluster, _) = cluster.split_n_validators_random(packet_loss_num_instances);
         Self::E {
-            instances: test_cluster.into_instances(),
+            instances: test_cluster.into_validator_instances(),
             percent: self.packet_loss_percent,
             duration: Duration::from_secs(self.duration_secs),
         }
     }
 }
 
+#[async_trait]
 impl Experiment for PacketLossRandomValidators {
-    fn run(&mut self, _context: &mut Context) -> BoxFuture<Result<Option<String>>> {
-        async move {
-            let mut instances = vec![];
-            for instance in self.instances.iter() {
-                let packet_loss = PacketLoss::new(instance.clone(), self.percent);
-                packet_loss.apply().await?;
-                instances.push(packet_loss)
-            }
-            time::delay_for(self.duration).await;
-            for instance in self.instances.iter() {
-                let remove_network_effects = RemoveNetworkEffects::new(instance.clone());
-                remove_network_effects.apply().await?;
-            }
-            Ok(None)
-        }
-            .boxed()
+    async fn run(&mut self, _context: &mut Context<'_>) -> anyhow::Result<()> {
+        let mut effects: Vec<_> = self
+            .instances
+            .clone()
+            .into_iter()
+            .map(|instance| PacketLoss::new(instance, self.percent))
+            .collect();
+        effects::activate_all(&mut effects).await?;
+        time::delay_for(self.duration).await;
+        effects::deactivate_all(&mut effects).await?;
+        Ok(())
     }
 
     fn deadline(&self) -> Duration {

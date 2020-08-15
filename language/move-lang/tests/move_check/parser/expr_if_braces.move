@@ -1,6 +1,9 @@
 module M {
-    f(cond: bool) {
-        // Braces required for control expression inside "if" expression
+    fun f(cond: bool) {
+        // Braces or parenthesis are not required for a control expression
+        // inside an "if" expression.
+        if (cond) { if (cond) () };
+        if (cond) ( if (cond) () );
         if (cond) if (cond) ()
     }
 }

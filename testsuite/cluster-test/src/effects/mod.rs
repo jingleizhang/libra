@@ -3,29 +3,26 @@
 
 #![forbid(unsafe_code)]
 
-mod delete_libra_data;
-mod network_delay;
-mod packet_loss;
-mod reboot;
-mod remove_network_effects;
-mod stop_container;
-
 use anyhow::Result;
-pub use delete_libra_data::DeleteLibraData;
-use futures::future::BoxFuture;
-pub use network_delay::three_region_simulation_effects;
-pub use network_delay::NetworkDelay;
-pub use packet_loss::PacketLoss;
-pub use reboot::Reboot;
-pub use remove_network_effects::RemoveNetworkEffects;
+use async_trait::async_trait;
+use futures::future::try_join_all;
 use std::fmt::Display;
-pub use stop_container::StopContainer;
 
-pub trait Action: Display + Send {
-    fn apply(&self) -> BoxFuture<Result<()>>;
+pub mod network_delay;
+pub mod packet_loss;
+
+#[async_trait]
+pub trait Effect: Display {
+    async fn activate(&mut self) -> Result<()>;
+    async fn deactivate(&mut self) -> Result<()>;
 }
 
-pub trait Effect: Display + Send {
-    fn activate(&self) -> BoxFuture<Result<()>>;
-    fn deactivate(&self) -> BoxFuture<Result<()>>;
+pub async fn activate_all<T: Effect>(effects: &mut Vec<T>) -> Result<()> {
+    try_join_all(effects.iter_mut().map(Effect::activate)).await?;
+    Ok(())
+}
+
+pub async fn deactivate_all<T: Effect>(effects: &mut Vec<T>) -> Result<()> {
+    try_join_all(effects.iter_mut().map(Effect::deactivate)).await?;
+    Ok(())
 }

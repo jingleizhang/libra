@@ -1,138 +1,62 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_crypto::{test_utils::TEST_SEED, PrivateKey, Uniform, ValidKeyStringExt};
-use mirai_annotations::verify_unreachable;
-use rand::{rngs::StdRng, SeedableRng};
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+//! This file implements a KeyPair data structure.
+//!
+//! The point of a KeyPair is to deserialize a private key into a structure
+//! that will only allow the private key to be moved out once
+//! (hence providing good key hygiene)
+//! while allowing access to the public key part forever.
+//!
+//! The public key part is dynamically derived during deserialization,
+//! while ignored during serialization.
+//!
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
-pub enum PrivateKeyContainer<T> {
-    Present(T),
-    Removed,
-    Absent,
+use libra_crypto::PrivateKey;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+/// ConfigKey places a clonable wrapper around PrivateKeys for config purposes only. The only time
+/// configs have keys is either for testing or for low security requirements. Libra recommends that
+/// keys be stored in key managers. If we make keys unclonable, then the configs must be mutable
+/// and that becomes a requirement strictly as a result of supporting test environments, which is
+/// undesirable. Hence this internal wrapper allows for keys to be clonable but only from configs.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ConfigKey<T: PrivateKey + Serialize> {
+    #[serde(bound(deserialize = "T: Deserialize<'de>"))]
+    pub(crate) key: T,
 }
 
-impl<T> PrivateKeyContainer<T>
-where
-    T: PrivateKey,
-{
-    pub fn take(&mut self) -> Option<T> {
-        match self {
-            PrivateKeyContainer::Present(_) => {
-                let key = std::mem::replace(self, PrivateKeyContainer::Removed);
-                match key {
-                    PrivateKeyContainer::Present(priv_key) => Some(priv_key),
-                    _ => verify_unreachable!(
-                        "mem::replace returned value for PrivateKeyContainer different from the one observed right before the call"
-                    ),
-                }
-            }
-            _ => None,
-        }
+impl<T: DeserializeOwned + PrivateKey + Serialize> ConfigKey<T> {
+    pub(crate) fn new(key: T) -> Self {
+        Self { key }
+    }
+
+    pub fn private_key(&self) -> T {
+        self.clone().key
+    }
+
+    pub fn public_key(&self) -> T::PublicKeyMaterial {
+        libra_crypto::PrivateKey::public_key(&self.key)
     }
 }
 
-impl<T> Serialize for PrivateKeyContainer<T>
-where
-    T: Serialize + ValidKeyStringExt,
-{
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            PrivateKeyContainer::Present(key) => serialize_key(key, serializer),
-            _ => serializer.serialize_str(""),
-        }
+impl<T: DeserializeOwned + PrivateKey + Serialize> Clone for ConfigKey<T> {
+    fn clone(&self) -> Self {
+        lcs::from_bytes(&lcs::to_bytes(self).unwrap()).unwrap()
     }
 }
 
-impl<'de, T> Deserialize<'de> for PrivateKeyContainer<T>
-where
-    T: ValidKeyStringExt + DeserializeOwned + 'static,
-{
-    fn deserialize<D>(deserializer: D) -> std::result::Result<PrivateKeyContainer<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Note: Any error in parsing is assumed to be due to the private key being absent.
-        deserialize_key(deserializer)
-            .map(PrivateKeyContainer::Present)
-            .or_else(|_| Ok(PrivateKeyContainer::Absent))
-    }
-}
-
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-pub struct KeyPair<T>
-where
-    T: PrivateKey + Serialize + ValidKeyStringExt,
-    T::PublicKeyMaterial: DeserializeOwned + 'static + Serialize + ValidKeyStringExt,
-{
-    #[serde(bound(deserialize = "PrivateKeyContainer<T>: Deserialize<'de>"))]
-    private_key: PrivateKeyContainer<T>,
-    #[serde(serialize_with = "serialize_key")]
-    #[serde(deserialize_with = "deserialize_key")]
-    public_key: T::PublicKeyMaterial,
-}
-
-impl<T> Default for KeyPair<T>
-where
-    T: PrivateKey + Serialize + Uniform + ValidKeyStringExt,
-    T::PublicKeyMaterial: DeserializeOwned + 'static + Serialize + ValidKeyStringExt,
-{
+#[cfg(test)]
+impl<T: PrivateKey + Serialize + libra_crypto::Uniform> Default for ConfigKey<T> {
     fn default() -> Self {
-        let mut rng = StdRng::from_seed(TEST_SEED);
-        let private_key = T::generate_for_testing(&mut rng);
-        let public_key = private_key.public_key();
         Self {
-            private_key: PrivateKeyContainer::Present(private_key),
-            public_key,
+            key: libra_crypto::Uniform::generate_for_testing(),
         }
     }
 }
 
-impl<T> KeyPair<T>
-where
-    T: PrivateKey + Serialize + ValidKeyStringExt,
-    T::PublicKeyMaterial: DeserializeOwned + 'static + Serialize + ValidKeyStringExt,
-{
-    pub fn load(private_key: T) -> Self {
-        let public_key = private_key.public_key();
-        Self {
-            private_key: PrivateKeyContainer::Present(private_key),
-            public_key,
-        }
+impl<T: PrivateKey + Serialize> PartialEq for ConfigKey<T> {
+    fn eq(&self, other: &Self) -> bool {
+        lcs::to_bytes(&self).unwrap() == lcs::to_bytes(&other).unwrap()
     }
-
-    pub fn public(&self) -> &T::PublicKeyMaterial {
-        &self.public_key
-    }
-
-    /// Beware, this destroys the private key from this NodeConfig
-    pub fn take_private(&mut self) -> Option<T> {
-        self.private_key.take()
-    }
-}
-
-pub fn serialize_key<S, K>(key: &K, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    K: Serialize + ValidKeyStringExt,
-{
-    key.to_encoded_string()
-        .map_err(<S::Error as serde::ser::Error>::custom)
-        .and_then(|str| serializer.serialize_str(&str[..]))
-}
-
-pub fn deserialize_key<'de, D, K>(deserializer: D) -> Result<K, D::Error>
-where
-    D: Deserializer<'de>,
-    K: ValidKeyStringExt + DeserializeOwned + 'static,
-{
-    let encoded_key: &str = Deserialize::deserialize(deserializer)?;
-    ValidKeyStringExt::from_encoded_string(encoded_key)
-        .map_err(<D::Error as serde::de::Error>::custom)
 }

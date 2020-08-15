@@ -1,14 +1,14 @@
-address 0x1:
+address 0x2 {
 
 module M {
-    use 0x1::X;
-
     resource struct S {}
 
-    foo<S: copyable>(s: S): S {
+    fun foo<S: copyable>(s: S): S {
         let s: S = (s: S);
-        let s: S = copy s;
+        let s: S = s;
         s
     }
+
+}
 
 }

@@ -1,12 +1,14 @@
-address 0x1:
+address 0x2 {
 
 module X {
-    foo() {}
+    fun foo() {}
 }
 
 module M {
-    use 0x1::X;
-    foo() {
+    use 0x2::X;
+    fun foo() {
         X::foo()
     }
+}
+
 }

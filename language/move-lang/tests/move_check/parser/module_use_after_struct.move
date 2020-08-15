@@ -1,5 +1,13 @@
+address 0x2 {
+module X {
+    public fun foo() {}
+}
+
 module M {
     struct S {}
-    // Use declarations must come before struct declarations.
-    use 0x1::X;
+    // Use declarations can come after struct declarations.
+    use 0x2::X;
+
+    fun g() { X::foo() }
+}
 }

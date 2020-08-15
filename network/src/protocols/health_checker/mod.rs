@@ -18,26 +18,121 @@
 //! - Use successful inbound pings as a sign of remote note being healthy
 //! - Ping a peer only in periods of no application-level communication with the peer
 use crate::{
-    proto::{HealthCheckerMsg, HealthCheckerMsg_oneof, Ping, Pong},
-    protocols::rpc::error::RpcError,
-    utils::MessageExt,
-    validator_network::{Event, HealthCheckerNetworkEvents, HealthCheckerNetworkSender},
+    constants::NETWORK_CHANNEL_SIZE,
+    counters,
+    error::NetworkError,
+    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
+    protocols::{
+        network::{Event, NetworkEvents, NetworkSender, NewNetworkSender},
+        rpc::error::RpcError,
+    },
+    ProtocolId,
 };
-use bytes05::Bytes;
+use bytes::Bytes;
+use channel::message_queues::QueueStyle;
 use futures::{
     channel::oneshot,
     stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
 };
+use libra_config::network_id::NetworkContext;
 use libra_logger::prelude::*;
+use libra_metrics::IntCounterVec;
 use libra_types::PeerId;
-use rand::{rngs::SmallRng, seq::SliceRandom, FromEntropy, Rng};
-use std::{collections::HashMap, time::Duration};
+use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
+pub mod builder;
 #[cfg(test)]
 mod test;
 
+/// The interface from Network to HealthChecker layer.
+///
+/// `HealthCheckerNetworkEvents` is a `Stream` of `PeerManagerNotification` where the
+/// raw `Bytes` rpc messages are deserialized into
+/// `HealthCheckerMsg` types. `HealthCheckerNetworkEvents` is a thin wrapper
+/// around an `channel::Receiver<PeerManagerNotification>`.
+pub type HealthCheckerNetworkEvents = NetworkEvents<HealthCheckerMsg>;
+
+/// The interface from HealthChecker to Networking layer.
+///
+/// This is a thin wrapper around a `NetworkSender<HealthCheckerMsg>`, so it is
+/// easy to clone and send off to a separate task. For example, the rpc requests
+/// return Futures that encapsulate the whole flow, from sending the request to
+/// remote, to finally receiving the response and deserializing. It therefore
+/// makes the most sense to make the rpc call on a separate async task, which
+/// requires the `HealthCheckerNetworkSender` to be `Clone` and `Send`.
+#[derive(Clone)]
+pub struct HealthCheckerNetworkSender {
+    inner: NetworkSender<HealthCheckerMsg>,
+}
+
+/// Configuration for the network endpoints to support HealthChecker.
+pub fn network_endpoint_config() -> (
+    Vec<ProtocolId>,
+    Vec<ProtocolId>,
+    QueueStyle,
+    usize,
+    Option<&'static IntCounterVec>,
+) {
+    (
+        vec![ProtocolId::HealthCheckerRpc],
+        vec![],
+        QueueStyle::LIFO,
+        NETWORK_CHANNEL_SIZE,
+        Some(&counters::PENDING_HEALTH_CHECKER_NETWORK_EVENTS),
+    )
+}
+
+impl NewNetworkSender for HealthCheckerNetworkSender {
+    fn new(
+        peer_mgr_reqs_tx: PeerManagerRequestSender,
+        connection_reqs_tx: ConnectionRequestSender,
+    ) -> Self {
+        Self {
+            inner: NetworkSender::new(peer_mgr_reqs_tx, connection_reqs_tx),
+        }
+    }
+}
+
+impl HealthCheckerNetworkSender {
+    /// Send a HealthChecker Ping RPC request to remote peer `recipient`. Returns
+    /// the remote peer's future `Pong` reply.
+    ///
+    /// The rpc request can be canceled at any point by dropping the returned
+    /// future.
+    pub async fn send_rpc(
+        &mut self,
+        recipient: PeerId,
+        req_msg: HealthCheckerMsg,
+        timeout: Duration,
+    ) -> Result<HealthCheckerMsg, RpcError> {
+        let protocol = ProtocolId::HealthCheckerRpc;
+        self.inner
+            .send_rpc(recipient, protocol, req_msg, timeout)
+            .await
+    }
+
+    pub async fn disconnect_peer(&mut self, peer_id: PeerId) -> Result<(), NetworkError> {
+        self.inner.disconnect_peer(peer_id).await
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum HealthCheckerMsg {
+    Ping(Ping),
+    Pong(Pong),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Ping(u32);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Pong(u32);
+
 /// The actor performing health checks by running the Ping protocol
 pub struct HealthChecker<TTicker> {
+    network_context: Arc<NetworkContext>,
     /// Ticker to trigger ping to a random peer. In production, the ticker is likely to be
     /// fixed duration interval timer.
     ticker: TTicker,
@@ -66,6 +161,7 @@ where
 {
     /// Create new instance of the [`HealthChecker`] actor.
     pub fn new(
+        network_context: Arc<NetworkContext>,
         ticker: TTicker,
         network_tx: HealthCheckerNetworkSender,
         network_rx: HealthCheckerNetworkEvents,
@@ -73,6 +169,7 @@ where
         ping_failures_tolerated: u64,
     ) -> Self {
         HealthChecker {
+            network_context,
             ticker,
             network_tx,
             network_rx,
@@ -90,50 +187,49 @@ where
             futures::select! {
                 event = self.network_rx.select_next_some() => {
                     match event {
-                        Ok(Event::NewPeer(peer_id)) => {
+                        Ok(Event::NewPeer(peer_id, _origin)) => {
                             self.connected.insert(peer_id, (self.round, 0));
                         },
-                        Ok(Event::LostPeer(peer_id)) => {
+                        Ok(Event::LostPeer(peer_id, _origin)) => {
                             self.connected.remove(&peer_id);
                         },
                         Ok(Event::RpcRequest((peer_id, msg, res_tx))) => {
-                            if let Some(HealthCheckerMsg_oneof::Ping(ping_msg)) = msg.message {
-                                self.handle_ping_request(peer_id, ping_msg, res_tx);
-                            } else {
-                                security_log(SecurityEvent::InvalidHealthCheckerMsg)
-                                    .error("Unexpected rpc message")
-                                    .data(&msg)
-                                    .data(&peer_id)
-                                    .log();
-                                debug_assert!(false, "Unexpected rpc message");
-                            }
+                            match msg {
+                            HealthCheckerMsg::Ping(ping) => self.handle_ping_request(peer_id, ping, res_tx),
+                            _ => {
+                                sl_error!(security_log(security_events::INVALID_HEALTHCHECKER_MSG)
+                                    .data("error", "Unexpected rpc message")
+                                    .data("message", &msg)
+                                    .data("peer_id", &peer_id)
+                                );
+                            },
+                            };
                         }
-                        Ok(Event::Message(_)) => {
-                            security_log(SecurityEvent::InvalidNetworkEventHC)
-                                .error("Unexpected network event")
-                                .data(&event)
-                                .log();
+                        Ok(Event::Message(msg)) => {
+                            sl_error!(security_log(security_events::INVALID_NETWORK_EVENT_HC)
+                                .data("error", "Unexpected network event")
+                                .data("event_message", &msg)
+                            );
                             debug_assert!(false, "Unexpected network event");
                         },
                         Err(err) => {
-                            security_log(SecurityEvent::InvalidNetworkEventHC)
-                                .error(&err)
-                                .log();
+                            sl_error!(security_log(security_events::INVALID_NETWORK_EVENT_HC)
+                            .data_display("error", &err));
+
                             debug_assert!(false, "Unexpected network error");
                         }
                     }
                 }
                 _ = self.ticker.select_next_some() => {
                     self.round += 1;
-                    debug!("Tick: Round number: {}", self.round);
                     match self.sample_random_peer() {
                         Some(peer_id) => {
-                            debug!("Will ping: {}", peer_id.short_str());
-
                             let nonce = self.sample_nonce();
+                            debug!("{} Will ping: {} for round: {} nonce: {}", self.network_context, peer_id.short_str(), self.round, nonce);
 
                             tick_handlers.push(
                                 Self::ping_peer(
+                                    self.network_context.clone(),
                                     self.network_tx.clone(),
                                     peer_id,
                                     self.round,
@@ -141,7 +237,7 @@ where
                                     self.ping_timeout.clone()));
                         }
                         None => {
-                            debug!("No connected peer to ping");
+                            debug!("{} No connected peer to ping round: {}", self.network_context, self.round);
                         }
                     }
                 }
@@ -150,31 +246,36 @@ where
                     self.handle_ping_response(peer_id, round, nonce, ping_result).await;
                 }
                 complete => {
-                    crit!("Health checker actor terminated");
                     break;
                 }
             }
         }
+        error!("{} Health checker actor terminated", self.network_context);
     }
 
     fn handle_ping_request(
         &mut self,
         peer_id: PeerId,
-        ping_msg: Ping,
+        ping: Ping,
         res_tx: oneshot::Sender<Result<Bytes, RpcError>>,
     ) {
-        let nonce = ping_msg.nonce;
-        let pong_msg = Pong { nonce };
-        let res_msg = HealthCheckerMsg {
-            message: Some(HealthCheckerMsg_oneof::Pong(pong_msg)),
+        let message = match lcs::to_bytes(&HealthCheckerMsg::Pong(Pong(ping.0))) {
+            Ok(msg) => msg,
+            Err(e) => {
+                warn!(
+                    "{} Unable to serialize pong response: {}",
+                    self.network_context, e
+                );
+                return;
+            }
         };
         debug!(
-            "Sending Pong response to peer: {} with nonce: {}",
+            "{} Sending Pong response to peer: {} with nonce: {}",
+            self.network_context,
             peer_id.short_str(),
-            nonce
+            ping.0,
         );
-        let res_data = res_msg.to_bytes().unwrap();
-        let _ = res_tx.send(Ok(res_data));
+        let _ = res_tx.send(Ok(message.into()));
     }
 
     async fn handle_ping_response(
@@ -184,12 +285,15 @@ where
         req_nonce: u32,
         ping_result: Result<Pong, RpcError>,
     ) {
-        debug!("Got result for ping round: {}", round);
         match ping_result {
-            Ok(pong_msg) => {
-                let res_nonce = pong_msg.nonce;
-                if res_nonce == req_nonce {
-                    debug!("Ping successful for peer: {}", peer_id.short_str());
+            Ok(pong) => {
+                if pong.0 == req_nonce {
+                    debug!(
+                        "{} Ping successful for peer: {} round: {}",
+                        self.network_context,
+                        peer_id.short_str(),
+                        round
+                    );
                     // Update last successful ping to current round.
                     self.connected
                         .entry(peer_id)
@@ -200,19 +304,21 @@ where
                             }
                         });
                 } else {
-                    security_log(SecurityEvent::InvalidHealthCheckerMsg)
-                        .error("Pong nonce doesn't match our challenge Ping nonce")
-                        .data(&peer_id)
-                        .data(req_nonce)
-                        .data(&pong_msg)
-                        .log();
+                    sl_error!(security_log(security_events::INVALID_HEALTHCHECKER_MSG)
+                        .data("error", "Pong nonce doesn't match our challenge Ping nonce")
+                        .data("req_nonce", &req_nonce)
+                        .data("peer_id", &peer_id)
+                        .data("pong", pong.0)
+                        .data("round", round));
                     debug_assert!(false, "Pong nonce doesn't match our challenge Ping nonce");
                 }
             }
             Err(err) => {
                 warn!(
-                    "Ping failed for peer: {} with error: {:?}",
+                    "{} Ping failed for peer: {} round: {} with error: {:?}",
+                    self.network_context,
                     peer_id.short_str(),
+                    round,
                     err
                 );
                 match self.connected.get_mut(&peer_id) {
@@ -231,10 +337,15 @@ where
                         // ConnectivityManager or the remote peer to re-establish the connection.
                         *failures += 1;
                         if *failures > self.ping_failures_tolerated {
-                            info!("Disonnecting from peer: {}", peer_id.short_str());
+                            info!(
+                                "{} Disconnecting from peer: {}",
+                                self.network_context,
+                                peer_id.short_str()
+                            );
                             if let Err(err) = self.network_tx.disconnect_peer(peer_id).await {
                                 warn!(
-                                    "Failed to disconnect from peer: {} with error: {:?}",
+                                    "{} Failed to disconnect from peer: {} with error: {:?}",
+                                    self.network_context,
                                     peer_id.short_str(),
                                     err
                                 );
@@ -247,19 +358,27 @@ where
     }
 
     async fn ping_peer(
+        network_context: Arc<NetworkContext>,
         mut network_tx: HealthCheckerNetworkSender,
         peer_id: PeerId,
         round: u64,
         nonce: u32,
         ping_timeout: Duration,
     ) -> (PeerId, u64, u32, Result<Pong, RpcError>) {
-        let ping_msg = Ping { nonce };
         debug!(
-            "Sending Ping request to peer: {} with nonce: {}",
+            "{} Sending Ping request to peer: {} for round: {} nonce: {}",
+            network_context,
             peer_id.short_str(),
+            round,
             nonce
         );
-        let res_pong_msg = network_tx.ping(peer_id, ping_msg, ping_timeout).await;
+        let res_pong_msg = network_tx
+            .send_rpc(peer_id, HealthCheckerMsg::Ping(Ping(nonce)), ping_timeout)
+            .await
+            .and_then(|msg| match msg {
+                HealthCheckerMsg::Pong(res) => Ok(res),
+                _ => Err(RpcError::InvalidRpcResponse),
+            });
         (peer_id, round, nonce, res_pong_msg)
     }
 

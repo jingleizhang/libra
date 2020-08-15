@@ -1,3 +1,3 @@
-// Top-level "use" declarations can only be followed by a main function.
-use 0x0::Module;
-address 0x1:
+// Top-level "use" are currently meaningless. The feature might be added some day
+use 0x1::Module;
+address 0x2 {}

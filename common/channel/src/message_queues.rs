@@ -2,18 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use libra_metrics::IntCounterVec;
-use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::{Debug, Formatter, Result},
+    hash::Hash,
+    num::NonZeroUsize,
+};
 
 /// QueueStyle is an enum which can be used as a configuration option for
 /// PerValidatorQueue. Since the queue per key is going to be bounded,
-/// QueueStyle also determines the policy for dropping messages.
+/// QueueStyle also determines the policy for dropping and retrieving messages.
 /// With LIFO, oldest messages are dropped.
 /// With FIFO, newest messages are dropped.
-#[derive(Clone, Copy)]
+/// With KLAST, oldest messages are dropped, but remaining are retrieved in FIFO order
+#[derive(Clone, Copy, Debug)]
 pub enum QueueStyle {
     LIFO,
     FIFO,
+    KLAST,
 }
 
 /// PerKeyQueue maintains a queue of messages per key. It
@@ -36,8 +42,22 @@ pub(crate) struct PerKeyQueue<K: Eq + Hash + Clone, T> {
     /// Keys for choosing the next message
     round_robin_queue: VecDeque<K>,
     /// Maximum number of messages to store per key
-    max_queue_size: usize,
+    max_queue_size: NonZeroUsize,
     counters: Option<&'static IntCounterVec>,
+}
+
+// TODO potentially add `per_key_queue` and `round_robin_queue`
+impl<K: Eq + Hash + Clone, T> Debug for PerKeyQueue<K, T> {
+    fn fmt(&self, f: &mut Formatter) -> Result {
+        write!(
+            f,
+            "PerKeyQueue {{\n\
+             queue_style: {:?},\n\
+             max_queue_size: {},\n\
+             }}",
+            self.queue_style, self.max_queue_size
+        )
+    }
 }
 
 impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
@@ -45,13 +65,9 @@ impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
     /// max_queue_size_per_key
     pub(crate) fn new(
         queue_style: QueueStyle,
-        max_queue_size_per_key: usize,
+        max_queue_size_per_key: NonZeroUsize,
         counters: Option<&'static IntCounterVec>,
     ) -> Self {
-        assert!(
-            max_queue_size_per_key > 0,
-            "max_queue_size_per_key should be > 0"
-        );
         Self {
             queue_style,
             max_queue_size: max_queue_size_per_key,
@@ -68,7 +84,7 @@ impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
         if let Some(q) = self.per_key_queue.get_mut(key) {
             // Extract message from the key's queue
             let retval = match self.queue_style {
-                QueueStyle::FIFO => q.pop_front(),
+                QueueStyle::FIFO | QueueStyle::KLAST => q.pop_front(),
                 QueueStyle::LIFO => q.pop_back(),
             };
             (retval, q.is_empty())
@@ -78,12 +94,13 @@ impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
     }
 
     /// push a message to the appropriate queue in per_key_queue
-    /// add the key to round_robin_queue if it didnt already exist
-    pub(crate) fn push(&mut self, key: K, message: T) {
+    /// add the key to round_robin_queue if it didnt already exist.
+    /// Returns Some(T) if the new or an existing element was dropped. Returns None otherwise.
+    pub(crate) fn push(&mut self, key: K, message: T) -> Option<T> {
         if let Some(c) = self.counters.as_ref() {
             c.with_label_values(&["enqueued"]).inc();
         }
-        let max_queue_size = self.max_queue_size;
+        let max_queue_size = self.max_queue_size.get();
         let key_message_queue = self
             .per_key_queue
             .entry(key.clone())
@@ -99,15 +116,17 @@ impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
             }
             match self.queue_style {
                 // Drop the newest message for FIFO
-                QueueStyle::FIFO => (),
+                QueueStyle::FIFO => Some(message),
                 // Drop the oldest message for LIFO
-                QueueStyle::LIFO => {
-                    key_message_queue.pop_front();
+                QueueStyle::LIFO | QueueStyle::KLAST => {
+                    let oldest = key_message_queue.pop_front();
                     key_message_queue.push_back(message);
+                    oldest
                 }
-            };
+            }
         } else {
             key_message_queue.push_back(message);
+            None
         }
     }
 

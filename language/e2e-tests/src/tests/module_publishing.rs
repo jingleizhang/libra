@@ -2,19 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account::AccountData, assert_prologue_parity, assert_status_eq,
-    compile::compile_module_with_address, executor::FakeExecutor, transaction_status_eq,
+    account::{Account, AccountData},
+    assert_prologue_parity,
+    compile::compile_module_with_address,
+    executor::FakeExecutor,
+    transaction_status_eq,
 };
-use libra_config::config::VMPublishingOption;
 use libra_types::{
+    account_config::{self},
+    on_chain_config::VMPublishingOption,
     transaction::TransactionStatus,
-    vm_error::{StatusCode, StatusType, VMStatus},
+    vm_status::{KeptVMStatus, StatusCode},
 };
 
 // A module with an address different from the sender's address should be rejected
 #[test]
 fn bad_module_address() {
-    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::Open);
+    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::open());
 
     // create a transaction trying to publish a new module.
     let account1 = AccountData::new(1_000_000, 10);
@@ -32,37 +36,37 @@ fn bad_module_address() {
     );
 
     // compile with account 1's address
-    let compiled_module = compile_module_with_address(account1.address(), &program);
+    let compiled_module = compile_module_with_address(account1.address(), "file_name", &program);
     // send with account 2's address
-    let txn = account2.account().create_signed_txn_impl(
-        *account2.address(),
-        compiled_module,
-        10,
-        100_000,
-        1,
-    );
+    let txn = account2
+        .account()
+        .transaction()
+        .module(compiled_module)
+        .sequence_number(10)
+        .gas_unit_price(1)
+        .sign();
 
+    // TODO: This is not verified for now.
     // verify and fail because the addresses don't match
-    let vm_status = executor.verify_transaction(txn.clone()).unwrap();
-    assert!(vm_status.is(StatusType::Verification));
-    assert!(vm_status.major_status == StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER);
+    // let vm_status = executor.verify_transaction(txn.clone()).status().unwrap();
+    // assert!(vm_status.is(StatusType::Verification));
+    // assert!(vm_status.major_status == StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER);
 
     // execute and fail for the same reason
     let output = executor.execute_transaction(txn);
-    let status = match output.status() {
-        TransactionStatus::Discard(status) => {
-            assert!(status.is(StatusType::Verification));
-            status
+    match output.status() {
+        TransactionStatus::Keep(status) => {
+            assert!(status == &KeptVMStatus::VerificationError);
+            // assert!(status.status_code() == StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER);
         }
         vm_status => panic!("Unexpected verification status: {:?}", vm_status),
     };
-    assert!(status.major_status == StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER);
 }
 
 // Publishing a module named M under the same address twice should be rejected
 #[test]
 fn duplicate_module() {
-    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::Open);
+    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::open());
 
     let sequence_number = 2;
     let account = AccountData::new(1_000_000, sequence_number);
@@ -75,44 +79,43 @@ fn duplicate_module() {
         }
         ",
     );
-    let compiled_module = compile_module_with_address(account.address(), &program);
+    let compiled_module = compile_module_with_address(account.address(), "file_name", &program);
 
-    let txn1 = account.account().create_signed_txn_impl(
-        *account.address(),
-        compiled_module.clone(),
-        sequence_number,
-        100_000,
-        1,
-    );
+    let txn1 = account
+        .account()
+        .transaction()
+        .module(compiled_module.clone())
+        .sequence_number(sequence_number)
+        .sign();
 
-    let txn2 = account.account().create_signed_txn_impl(
-        *account.address(),
-        compiled_module,
-        sequence_number + 1,
-        100_000,
-        1,
-    );
+    let txn2 = account
+        .account()
+        .transaction()
+        .module(compiled_module)
+        .sequence_number(sequence_number + 1)
+        .sign();
 
     let output1 = executor.execute_transaction(txn1);
     executor.apply_write_set(output1.write_set());
     // first tx should succeed
     assert!(transaction_status_eq(
         &output1.status(),
-        &TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)),
+        &TransactionStatus::Keep(KeptVMStatus::Executed),
     ));
 
     // second one should fail because it tries to re-publish a module named M
     let output2 = executor.execute_transaction(txn2);
     assert!(transaction_status_eq(
         &output2.status(),
-        &TransactionStatus::Keep(VMStatus::new(StatusCode::DUPLICATE_MODULE_NAME)),
+        &TransactionStatus::Keep(KeptVMStatus::VerificationError),
     ));
 }
 
 #[test]
-pub fn test_publishing_no_modules_non_whitelist_script() {
+pub fn test_publishing_no_modules_non_allowlist_script() {
     // create a FakeExecutor with a genesis from file
-    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::CustomScripts);
+    let mut executor =
+        FakeExecutor::from_genesis_with_options(VMPublishingOption::custom_scripts());
 
     // create a transaction trying to publish a new module.
     let sender = AccountData::new(1_000_000, 10);
@@ -125,23 +128,144 @@ pub fn test_publishing_no_modules_non_whitelist_script() {
         ",
     );
 
-    let random_script = compile_module_with_address(sender.address(), &program);
-    let txn =
-        sender
-            .account()
-            .create_signed_txn_impl(*sender.address(), random_script, 10, 100_000, 1);
+    let random_module = compile_module_with_address(sender.address(), "file_name", &program);
+    let txn = sender
+        .account()
+        .transaction()
+        .module(random_module)
+        .sequence_number(10)
+        .gas_unit_price(1)
+        .sign();
 
     assert_prologue_parity!(
-        executor.verify_transaction(txn.clone()),
+        executor.verify_transaction(txn.clone()).status(),
         executor.execute_transaction(txn).status(),
-        VMStatus::new(StatusCode::UNKNOWN_MODULE)
+        StatusCode::INVALID_MODULE_PUBLISHER
+    );
+}
+
+#[test]
+pub fn test_publishing_no_modules_non_allowlist_script_proper_sender() {
+    // create a FakeExecutor with a genesis from file
+    let executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::custom_scripts());
+
+    // create a transaction trying to publish a new module.
+    let sender = Account::new_libra_root();
+
+    let program = String::from(
+        "
+        module M {
+        }
+        ",
+    );
+
+    let random_module =
+        compile_module_with_address(&account_config::CORE_CODE_ADDRESS, "file_name", &program);
+    let txn = sender
+        .transaction()
+        .module(random_module)
+        .sequence_number(1)
+        .sign();
+    assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
+    assert_eq!(
+        executor.execute_transaction(txn).status(),
+        &TransactionStatus::Keep(KeptVMStatus::Executed)
+    );
+}
+
+#[test]
+pub fn test_publishing_no_modules_proper_sender() {
+    // create a FakeExecutor with a genesis from file
+    let executor = FakeExecutor::allowlist_genesis();
+
+    // create a transaction trying to publish a new module.
+    let sender = Account::new_libra_root();
+
+    let program = String::from(
+        "
+        module M {
+        }
+        ",
+    );
+
+    let random_script =
+        compile_module_with_address(&account_config::CORE_CODE_ADDRESS, "file_name", &program);
+    let txn = sender
+        .transaction()
+        .module(random_script)
+        .sequence_number(1)
+        .sign();
+    assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
+    assert_eq!(
+        executor.execute_transaction(txn).status(),
+        &TransactionStatus::Keep(KeptVMStatus::Executed)
+    );
+}
+
+#[test]
+pub fn test_publishing_no_modules_core_code_sender() {
+    // create a FakeExecutor with a genesis from file
+    let executor = FakeExecutor::allowlist_genesis();
+
+    // create a transaction trying to publish a new module.
+    let sender = Account::new_genesis_account(account_config::CORE_CODE_ADDRESS);
+
+    let program = String::from(
+        "
+        module M {
+        }
+        ",
+    );
+
+    let random_script =
+        compile_module_with_address(&account_config::CORE_CODE_ADDRESS, "file_name", &program);
+    let txn = sender
+        .transaction()
+        .module(random_script)
+        .sequence_number(1)
+        .sign();
+    // Doesn't work because the core code address doesn't exist
+    assert_prologue_parity!(
+        executor.verify_transaction(txn.clone()).status(),
+        executor.execute_transaction(txn).status(),
+        StatusCode::INVALID_MODULE_PUBLISHER
+    );
+}
+
+#[test]
+pub fn test_publishing_no_modules_invalid_sender() {
+    // create a FakeExecutor with a genesis from file
+    let mut executor = FakeExecutor::allowlist_genesis();
+
+    // create a transaction trying to publish a new module.
+    let sender = AccountData::new(1_000_000, 10);
+    executor.add_account_data(&sender);
+
+    let program = String::from(
+        "
+        module M {
+        }
+        ",
+    );
+
+    let random_script = compile_module_with_address(sender.address(), "file_name", &program);
+    let txn = sender
+        .account()
+        .transaction()
+        .module(random_script)
+        .sequence_number(10)
+        .sign();
+    assert_prologue_parity!(
+        executor.verify_transaction(txn.clone()).status(),
+        executor.execute_transaction(txn).status(),
+        StatusCode::INVALID_MODULE_PUBLISHER
     );
 }
 
 #[test]
 pub fn test_publishing_allow_modules() {
     // create a FakeExecutor with a genesis from file
-    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::Open);
+    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::open());
 
     // create a transaction trying to publish a new module.
     let sender = AccountData::new(1_000_000, 10);
@@ -154,14 +278,16 @@ pub fn test_publishing_allow_modules() {
         ",
     );
 
-    let random_script = compile_module_with_address(sender.address(), &program);
-    let txn =
-        sender
-            .account()
-            .create_signed_txn_impl(*sender.address(), random_script, 10, 100_000, 1);
-    assert_eq!(executor.verify_transaction(txn.clone()), None);
+    let random_script = compile_module_with_address(sender.address(), "file_name", &program);
+    let txn = sender
+        .account()
+        .transaction()
+        .module(random_script)
+        .sequence_number(10)
+        .sign();
+    assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
     assert_eq!(
         executor.execute_transaction(txn).status(),
-        &TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED))
+        &TransactionStatus::Keep(KeptVMStatus::Executed)
     );
 }

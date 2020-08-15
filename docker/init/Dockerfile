@@ -3,9 +3,7 @@ FROM debian:buster AS toolchain
 # To use http/https proxy while building, use:
 # docker build --build-arg https_proxy=http://fwdproxy:8080 --build-arg http_proxy=http://fwdproxy:8080
 
-RUN echo "deb http://deb.debian.org/debian buster-backports main" > /etc/apt/sources.list.d/backports.list \
-    && apt-get update && apt-get install -y protobuf-compiler/buster cmake curl clang git \
-    && apt-get clean && rm -r /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y cmake curl clang git
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 ENV PATH "$PATH:/root/.cargo/bin"
@@ -14,21 +12,26 @@ WORKDIR /libra
 COPY rust-toolchain /libra/rust-toolchain
 RUN rustup install $(cat rust-toolchain)
 
+COPY cargo-toolchain /libra/cargo-toolchain
+RUN rustup install $(cat cargo-toolchain)
+
 FROM toolchain AS builder
 
 COPY . /libra
 
-RUN cargo build --release -p config-builder -p generate-keypair && cd target/release && rm -r build deps incremental
-RUN strip target/release/libra-config target/release/generate-keypair
+RUN ./docker/build-common.sh
 
 ### Production Image ###
 FROM debian:buster AS prod
 
-RUN apt-get update && apt-get install gettext-base && apt-get clean && rm -r /var/lib/apt/lists/*
+RUN apt-get update && apt-get -y install wget busybox gettext-base && apt-get clean && rm -r /var/lib/apt/lists/*
+RUN cd /usr/local/bin && busybox wget "https://storage.googleapis.com/kubernetes-release/release/v1.18.6/bin/linux/amd64/kubectl" -O kubectl && chmod +x kubectl
+RUN cd /usr/local/bin && busybox wget "https://releases.hashicorp.com/vault/1.5.0/vault_1.5.0_linux_amd64.zip" -O - | busybox unzip - && chmod +x vault
 
 RUN mkdir -p /opt/libra/bin
-COPY --from=builder /libra/target/release/libra-config /opt/libra/bin
-COPY --from=builder /libra/target/release/generate-keypair /opt/libra/bin
+COPY --from=builder /libra/target/release/config-builder /opt/libra/bin
+COPY --from=builder /libra/target/release/libra-genesis-tool /usr/local/bin
+COPY --from=builder /libra/target/release/libra-operational-tool /usr/local/bin
 
 ARG BUILD_DATE
 ARG GIT_REV

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account::{Account, AccountData},
+    account::{lbr_currency_code, Account, AccountData, AccountRoleSpecifier},
     account_universe::{
         txn_one_account_result, AUTransactionGen, AccountPair, AccountPairGen, AccountUniverse,
     },
@@ -11,11 +11,13 @@ use crate::{
 };
 use libra_proptest_helpers::Index;
 use libra_types::{
+    account_config,
     transaction::{SignedTransaction, TransactionStatus},
-    vm_error::{StatusCode, VMStatus},
+    vm_status::{AbortLocation, KeptVMStatus, StatusCode},
 };
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
+use std::sync::Arc;
 
 /// Represents a create-account transaction performed in the account universe.
 ///
@@ -34,32 +36,41 @@ impl AUTransactionGen for CreateAccountGen {
         &self,
         universe: &mut AccountUniverse,
     ) -> (SignedTransaction, (TransactionStatus, u64)) {
-        let sender = universe.pick(&self.sender).1;
+        let sender = universe.pick(self.sender).1;
 
         let txn = create_account_txn(
             sender.account(),
             &self.new_account,
             sender.sequence_number,
             self.amount,
+            account_config::lbr_type_tag(),
         );
 
-        let mut gas_cost = sender.create_account_gas_cost();
-        let low_balance_gas_cost = sender.create_account_low_balance_gas_cost();
+        let mut gas_used = sender.create_account_gas_cost();
+        let low_balance_gas_used = sender.create_account_low_balance_gas_cost();
+        let gas_price = txn.gas_unit_price();
 
-        let (status, is_success) =
-            txn_one_account_result(sender, self.amount, gas_cost, low_balance_gas_cost);
+        let (status, is_success) = txn_one_account_result(
+            sender,
+            self.amount,
+            gas_price,
+            gas_used,
+            low_balance_gas_used,
+        );
         if is_success {
             sender.event_counter_created = true;
             universe.add_account(AccountData::with_account(
                 self.new_account.clone(),
                 self.amount,
+                lbr_currency_code(),
                 0,
+                AccountRoleSpecifier::default(),
             ));
         } else {
-            gas_cost = 0;
+            gas_used = 0;
         }
 
-        (txn, (status, gas_cost))
+        (txn, (status, gas_used))
     }
 }
 
@@ -91,24 +102,37 @@ impl AUTransactionGen for CreateExistingAccountGen {
             receiver.account(),
             sender.sequence_number,
             self.amount,
+            account_config::lbr_type_tag(),
         );
 
         // This transaction should never work, but it will fail differently if there's not enough
         // gas to reserve.
-        let mut gas_cost = 0;
-        let enough_max_gas = sender.balance >= gas_costs::TXN_RESERVED;
+        let mut gas_used = 0;
+        let gas_price = txn.gas_unit_price();
+        let enough_max_gas = sender.balance >= gas_costs::TXN_RESERVED * gas_price;
         let status = if enough_max_gas {
             sender.sequence_number += 1;
-            gas_cost = sender.create_existing_account_gas_cost();
-            sender.balance -= gas_cost;
-            TransactionStatus::Keep(VMStatus::new(StatusCode::CANNOT_WRITE_EXISTING_RESOURCE))
+            gas_used = sender.create_existing_account_gas_cost();
+            sender.balance -= gas_used * gas_price;
+            // TODO(tmn) provide a real abort location
+            TransactionStatus::Keep(KeptVMStatus::MoveAbort(AbortLocation::Script, 777_777))
         } else {
             // Not enough gas to get past the prologue.
-            TransactionStatus::Discard(VMStatus::new(
-                StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE,
-            ))
+            TransactionStatus::Discard(StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE)
         };
 
-        (txn, (status, gas_cost))
+        (txn, (status, gas_used))
     }
+}
+
+pub fn create_account_strategy(
+    min: u64,
+    max: u64,
+) -> impl Strategy<Value = Arc<dyn AUTransactionGen + 'static>> {
+    prop_oneof![
+        3 => any_with::<CreateAccountGen>((min, max)).prop_map(CreateAccountGen::arced),
+        1 => any_with::<CreateExistingAccountGen>((min, max)).prop_map(
+            CreateExistingAccountGen::arced,
+        ),
+    ]
 }

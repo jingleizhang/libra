@@ -9,6 +9,7 @@ resource "aws_instance" "faucet" {
   subnet_id                   = element(aws_subnet.testnet.*.id, 0)
   depends_on                  = [aws_main_route_table_association.testnet]
   vpc_security_group_ids      = [aws_security_group.faucet-host.id]
+  private_ip                  = var.override_faucet_ip == "" ? null : var.override_faucet_ip
   associate_public_ip_address = local.instance_public_ip
   key_name                    = aws_key_pair.libra.key_name
   iam_instance_profile        = aws_iam_instance_profile.ecsInstanceRole.name
@@ -17,6 +18,7 @@ resource "aws_instance" "faucet" {
   tags = {
     Name      = "${terraform.workspace}-faucet"
     Role      = "faucet"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }
@@ -28,7 +30,8 @@ data "template_file" "ecs_faucet_definition" {
     faucet_image_repo    = local.faucet_image_repo
     faucet_image_tag_str = substr(var.image_tag, 0, 6) == "sha256" ? "@${local.faucet_image_tag}" : ":${local.faucet_image_tag}"
     ac_hosts             = join(",", aws_instance.validator.*.private_ip)
-    cfg_num_validators   = var.num_validators
+    chain_id             = var.chain_id
+    cfg_num_validators   = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
     cfg_seed             = var.config_seed
     log_level            = var.faucet_log_level
     log_group            = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
@@ -39,6 +42,7 @@ data "template_file" "ecs_faucet_definition" {
 
 resource "aws_ecs_task_definition" "faucet" {
   family                = "${terraform.workspace}-faucet"
+  depends_on            = [aws_instance.validator]
   container_definitions = data.template_file.ecs_faucet_definition.rendered
   execution_role_arn    = aws_iam_role.ecsTaskExecutionRole.arn
 
@@ -49,6 +53,7 @@ resource "aws_ecs_task_definition" "faucet" {
 
   tags = {
     Role      = "faucet"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }
@@ -63,6 +68,7 @@ resource "aws_ecs_service" "faucet" {
 
   tags = {
     Role      = "faucet"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }

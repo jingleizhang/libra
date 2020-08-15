@@ -1,13 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use bytecode_verifier::VerifiedModule;
+use bytecode_verifier::verify_module;
+use rand::{rngs::StdRng, SeedableRng};
 use utils::module_generation::{generate_module, ModuleGeneratorOptions};
 
 #[test]
 fn module_generation() {
-    for _ in 0..500 {
-        let module = generate_module(ModuleGeneratorOptions::default());
-        VerifiedModule::new(module).unwrap();
+    let mut rng = StdRng::from_entropy();
+    for _ in 0..50 {
+        let module = generate_module(&mut rng, ModuleGeneratorOptions::default());
+        verify_module(&module).unwrap();
     }
 }

@@ -10,11 +10,22 @@
 //! benefit.
 
 mod account_universe;
+mod admin_script;
 mod create_account;
+mod data_store;
+mod execution_strategies;
+mod failed_transaction_tests;
 mod genesis;
 mod mint;
 mod module_publishing;
+mod on_chain_configs;
 mod peer_to_peer;
 mod rotate_key;
+mod scripts;
+mod transaction_builder;
+mod transaction_fees;
+mod transaction_fuzzer;
 mod validator_set_management;
+mod vasps;
 mod verify_txn;
+mod write_set;

@@ -3,44 +3,61 @@
 
 #![forbid(unsafe_code)]
 
-mod multi_region_network_simulation;
+mod client_compatibility_test;
+mod compatibility_test;
+mod cpu_flamegraph;
 mod packet_loss_random_validators;
-mod performance_benchmark_nodes_down;
+mod performance_benchmark;
 mod performance_benchmark_three_region_simulation;
-mod reboot_random_validator;
+mod reboot_cluster;
+mod reboot_random_validators;
 mod recovery_time;
+mod twin_validator;
+mod versioning_test;
 
-use std::time::Duration;
-use std::{collections::HashSet, fmt::Display};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    time::Duration,
+};
 
-pub use multi_region_network_simulation::{MultiRegionSimulation, MultiRegionSimulationParams};
+pub use client_compatibility_test::{ClientCompatibilityTest, ClientCompatiblityTestParams};
+pub use compatibility_test::{CompatibilityTest, CompatiblityTestParams};
 pub use packet_loss_random_validators::{
     PacketLossRandomValidators, PacketLossRandomValidatorsParams,
 };
-pub use performance_benchmark_nodes_down::{
-    PerformanceBenchmarkNodesDown, PerformanceBenchmarkNodesDownParams,
-};
+pub use performance_benchmark::{PerformanceBenchmark, PerformanceBenchmarkParams};
 pub use performance_benchmark_three_region_simulation::{
     PerformanceBenchmarkThreeRegionSimulation, PerformanceBenchmarkThreeRegionSimulationParams,
 };
-pub use reboot_random_validator::{RebootRandomValidators, RebootRandomValidatorsParams};
+pub use reboot_cluster::{RebootCluster, RebootClusterParams};
+pub use reboot_random_validators::{RebootRandomValidators, RebootRandomValidatorsParams};
 pub use recovery_time::{RecoveryTime, RecoveryTimeParams};
+pub use twin_validator::{TwinValidators, TwinValidatorsParams};
+pub use versioning_test::{ValidatorVersioning, ValidatorVersioningParams};
 
-use crate::cluster::Cluster;
-use crate::prometheus::Prometheus;
-use crate::tx_emitter::TxEmitter;
-use futures::future::BoxFuture;
-use std::collections::HashMap;
+use crate::{
+    cluster::Cluster,
+    cluster_builder::{ClusterBuilder, ClusterBuilderParams},
+    prometheus::Prometheus,
+    report::SuiteReport,
+    tx_emitter::{EmitJobRequest, TxEmitter},
+};
+
+use crate::{
+    cluster_swarm::{cluster_swarm_kube::ClusterSwarmKube, ClusterSwarm},
+    health::TraceTail,
+};
+use async_trait::async_trait;
+pub use cpu_flamegraph::{CpuFlamegraph, CpuFlamegraphParams};
 use structopt::{clap::AppSettings, StructOpt};
 
+#[async_trait]
 pub trait Experiment: Display + Send {
     fn affected_validators(&self) -> HashSet<String> {
         HashSet::new()
     }
-    fn run<'a>(
-        &'a mut self,
-        context: &'a mut Context,
-    ) -> BoxFuture<'a, anyhow::Result<Option<String>>>;
+    async fn run(&mut self, context: &mut Context<'_>) -> anyhow::Result<()>;
     fn deadline(&self) -> Duration;
 }
 
@@ -49,18 +66,47 @@ pub trait ExperimentParam {
     fn build(self, cluster: &Cluster) -> Self::E;
 }
 
-pub struct Context {
-    tx_emitter: TxEmitter,
-    prometheus: Prometheus,
-    cluster: Cluster,
+pub struct Context<'a> {
+    pub tx_emitter: &'a mut TxEmitter,
+    pub trace_tail: &'a mut TraceTail,
+    pub prometheus: &'a Prometheus,
+    pub cluster_builder: &'a mut ClusterBuilder,
+    pub cluster_builder_params: &'a ClusterBuilderParams,
+    pub cluster: &'a Cluster,
+    pub report: &'a mut SuiteReport,
+    pub global_emit_job_request: &'a mut Option<EmitJobRequest>,
+    pub emit_to_validator: bool,
+    pub cluster_swarm: &'a dyn ClusterSwarm,
+    /// Current docker image tag used by this run
+    pub current_tag: &'a str,
 }
 
-impl Context {
-    pub fn new(tx_emitter: TxEmitter, prometheus: Prometheus, cluster: Cluster) -> Self {
+impl<'a> Context<'a> {
+    pub fn new(
+        tx_emitter: &'a mut TxEmitter,
+        trace_tail: &'a mut TraceTail,
+        prometheus: &'a Prometheus,
+        cluster_builder: &'a mut ClusterBuilder,
+        cluster_builder_params: &'a ClusterBuilderParams,
+        cluster: &'a Cluster,
+        report: &'a mut SuiteReport,
+        emit_job_request: &'a mut Option<EmitJobRequest>,
+        emit_to_validator: bool,
+        cluster_swarm: &'a ClusterSwarmKube,
+        current_tag: &'a str,
+    ) -> Self {
         Context {
             tx_emitter,
+            trace_tail,
             prometheus,
+            cluster_builder,
+            cluster_builder_params,
             cluster,
+            report,
+            global_emit_job_request: emit_job_request,
+            emit_to_validator,
+            cluster_swarm,
+            current_tag,
         }
     }
 }
@@ -89,25 +135,27 @@ pub fn get_experiment(name: &str, args: &[String], cluster: &Cluster) -> Box<dyn
 
     known_experiments.insert("recovery_time", f::<RecoveryTimeParams>());
     known_experiments.insert(
-        "multi_region_simulation",
-        f::<MultiRegionSimulationParams>(),
-    );
-    known_experiments.insert(
         "packet_loss_random_validators",
         f::<PacketLossRandomValidatorsParams>(),
     );
+    known_experiments.insert("bench", f::<PerformanceBenchmarkParams>());
     known_experiments.insert(
-        "performance_benchmark_nodes_down",
-        f::<PerformanceBenchmarkNodesDownParams>(),
-    );
-    known_experiments.insert(
-        "performance_benchmark_three_region_simulation",
+        "bench_three_region",
         f::<PerformanceBenchmarkThreeRegionSimulationParams>(),
     );
     known_experiments.insert(
         "reboot_random_validators",
         f::<RebootRandomValidatorsParams>(),
     );
+    known_experiments.insert("twin", f::<TwinValidatorsParams>());
+    known_experiments.insert("generate_cpu_flamegraph", f::<CpuFlamegraphParams>());
+    known_experiments.insert("versioning_testing", f::<ValidatorVersioningParams>());
+    known_experiments.insert("compatibility_test", f::<CompatiblityTestParams>());
+    known_experiments.insert(
+        "client_compatibility_test",
+        f::<ClientCompatiblityTestParams>(),
+    );
+    known_experiments.insert("reboot_cluster", f::<RebootClusterParams>());
 
     let builder = known_experiments.get(name).expect("Experiment not found");
     builder(args, cluster)

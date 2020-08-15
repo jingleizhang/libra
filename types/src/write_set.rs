@@ -1,8 +1,6 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 //! For each transaction the VM executes, the VM will output a `WriteSet` that contains each access
 //! path it updates. For each access path, the VM can either give its new value or delete it.
 
@@ -13,7 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum WriteOp {
     Deletion,
-    Value(Vec<u8>),
+    Value(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 impl WriteOp {
@@ -50,17 +48,12 @@ pub struct WriteSet(WriteSetMut);
 
 impl WriteSet {
     #[inline]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     #[inline]
-    pub fn iter<'a>(&'a self) -> ::std::slice::Iter<'a, (AccessPath, WriteOp)> {
+    pub fn iter(&self) -> ::std::slice::Iter<'_, (AccessPath, WriteOp)> {
         self.into_iter()
     }
 
@@ -85,11 +78,6 @@ impl WriteSetMut {
 
     pub fn push(&mut self, item: (AccessPath, WriteOp)) {
         self.write_set.push(item);
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.write_set.len()
     }
 
     #[inline]

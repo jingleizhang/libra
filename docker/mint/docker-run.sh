@@ -1,11 +1,24 @@
-#!/bin/sh
+#!/bin/bash
 # Copyright (c) The Libra Core Contributors
 # SPDX-License-Identifier: Apache-2.0
 
 set -ex
 export RUST_BACKTRACE=full
-/opt/libra/bin/dynamic-config-builder -d /opt/libra/etc -o /opt/libra/etc --faucet-client -a "/ip4/0.0.0.0/tcp/1" \
--b "/ip4/0.0.0.0/tcp/1" -l "/ip4/0.0.0.0/tcp/1" -n $CFG_NUM_VALIDATORS -s $CFG_SEED
+
+declare -a params
+if [ -n "${CFG_CHAIN_ID}" ]; then
+        params+="--chain-id ${CFG_CHAIN_ID} "
+fi
+if [ -n "${CFG_SEED}" ]; then
+    params+="-s $CFG_SEED "
+fi
+if [ -n "${CFG_NUM_VALIDATORS}" ]; then # Total number of nodes in this network
+	  params+="-n ${CFG_NUM_VALIDATORS} "
+fi
+
+/opt/libra/bin/config-builder faucet \
+    -o /opt/libra/etc \
+    ${params[@]}
 
 cd /opt/libra/bin && \
 exec gunicorn --bind 0.0.0.0:8000 --access-logfile - --error-logfile - --log-level $LOG_LEVEL server

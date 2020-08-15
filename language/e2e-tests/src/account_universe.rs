@@ -11,50 +11,54 @@
 //! For examples of property-based tests written against this model, see the
 //! `tests/account_universe` directory.
 
+mod bad_transaction;
 mod create_account;
 mod peer_to_peer;
 mod rotate_key;
 mod universe;
+pub use bad_transaction::*;
 pub use create_account::*;
 pub use peer_to_peer::*;
 pub use rotate_key::*;
 pub use universe::*;
 
 use crate::{
-    account::{Account, AccountData},
-    gas_costs,
+    account::{self, lbr_currency_code, Account, AccountData},
+    executor::FakeExecutor,
+    gas_costs, transaction_status_eq,
 };
-use lazy_static::lazy_static;
 use libra_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use libra_types::{
     transaction::{SignedTransaction, TransactionStatus},
-    vm_error::{StatusCode, VMStatus},
+    vm_status::{known_locations, KeptVMStatus, StatusCode},
 };
+use once_cell::sync::Lazy;
 use proptest::{prelude::*, strategy::Union};
 use std::{fmt, sync::Arc};
 
-lazy_static! {
-    static ref UNIVERSE_SIZE: usize = {
-        use std::{env, process::abort};
+static UNIVERSE_SIZE: Lazy<usize> = Lazy::new(|| {
+    use std::{env, process::abort};
 
-        match env::var("UNIVERSE_SIZE") {
-            Ok(s) => match s.parse::<usize>() {
-                Ok(val) => val,
-                Err(err) => {
-                    println!("Could not parse universe size, aborting: {:?}", err);
-                    // Abort because lazy_static with panics causes poisoning and isn't very
-                    // helpful overall.
-                    abort();
-                }
-            }
-            Err(env::VarError::NotPresent) => 20,
+    match env::var("UNIVERSE_SIZE") {
+        Ok(s) => match s.parse::<usize>() {
+            Ok(val) => val,
             Err(err) => {
-                println!("Could not read universe size from the environment, aborting: {:?}", err);
+                println!("Could not parse universe size, aborting: {:?}", err);
+                // Abort because Lazy with panics causes poisoning and isn't very
+                // helpful overall.
                 abort();
             }
+        },
+        Err(env::VarError::NotPresent) => 20,
+        Err(err) => {
+            println!(
+                "Could not read universe size from the environment, aborting: {:?}",
+                err
+            );
+            abort();
         }
-    };
-}
+    }
+});
 
 /// The number of accounts to run universe-based proptests with. Set with the `UNIVERSE_SIZE`
 /// environment variable.
@@ -119,7 +123,7 @@ pub struct AccountCurrent {
 
 impl AccountCurrent {
     fn new(initial_data: AccountData) -> Self {
-        let balance = initial_data.balance();
+        let balance = initial_data.balance(&lbr_currency_code());
         let sequence_number = initial_data.sequence_number();
         let sent_events_count = initial_data.sent_events_count();
         let received_events_count = initial_data.received_events_count();
@@ -236,14 +240,15 @@ impl AccountCurrent {
 pub fn txn_one_account_result(
     sender: &mut AccountCurrent,
     amount: u64,
-    gas_cost: u64,
-    low_gas_cost: u64,
+    gas_price: u64,
+    gas_used: u64,
+    low_gas_used: u64,
 ) -> (TransactionStatus, bool) {
     // The transactions set the gas cost to 1 microlibra.
-    let enough_max_gas = sender.balance >= gas_costs::TXN_RESERVED;
+    let enough_max_gas = sender.balance >= gas_costs::TXN_RESERVED * gas_price;
     // This means that we'll get through the main part of the transaction.
     let enough_to_transfer = sender.balance >= amount;
-    let to_deduct = amount + gas_cost;
+    let to_deduct = amount + gas_used * gas_price;
     // This means that we'll get through the entire transaction, including the epilogue
     // (where gas costs are deducted).
     let enough_to_succeed = sender.balance >= to_deduct;
@@ -254,19 +259,19 @@ pub fn txn_one_account_result(
             sender.sequence_number += 1;
             sender.sent_events_count += 1;
             sender.balance -= to_deduct;
-            (
-                TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)),
-                true,
-            )
+            (TransactionStatus::Keep(KeptVMStatus::Executed), true)
         }
         (true, true, false) => {
             // Enough gas to pass validation and to do the transfer, but not enough to succeed
             // in the epilogue. The transaction will be run and gas will be deducted from the
             // sender, but no other changes will happen.
             sender.sequence_number += 1;
-            sender.balance -= gas_cost;
+            sender.balance -= gas_used * gas_price;
             (
-                TransactionStatus::Keep(VMStatus::new(StatusCode::ABORTED).with_sub_status(6)),
+                TransactionStatus::Keep(KeptVMStatus::MoveAbort(
+                    known_locations::account_module_abort(),
+                    6,
+                )),
                 false,
             )
         }
@@ -275,18 +280,19 @@ pub fn txn_one_account_result(
             // be run and gas will be deducted from the sender, but no other changes will
             // happen.
             sender.sequence_number += 1;
-            sender.balance -= low_gas_cost;
+            sender.balance -= low_gas_used * gas_price;
             (
-                TransactionStatus::Keep(VMStatus::new(StatusCode::ABORTED).with_sub_status(10)),
+                TransactionStatus::Keep(KeptVMStatus::MoveAbort(
+                    known_locations::account_module_abort(),
+                    10,
+                )),
                 false,
             )
         }
         (false, _, _) => {
             // Not enough gas to pass validation. Nothing will happen.
             (
-                TransactionStatus::Discard(VMStatus::new(
-                    StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE,
-                )),
+                TransactionStatus::Discard(StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE),
                 false,
             )
         }
@@ -313,4 +319,123 @@ pub fn log_balance_strategy(max_balance: u64) -> impl Strategy<Value = u64> {
         upper_bound = (upper_bound * 2).min(max_balance);
     }
     Union::new(strategies)
+}
+
+/// A strategy that returns a random transaction.
+pub fn all_transactions_strategy(
+    min: u64,
+    max: u64,
+) -> impl Strategy<Value = Arc<dyn AUTransactionGen + 'static>> {
+    prop_oneof![
+        // Most transactions should be p2p payments.
+        8 => p2p_strategy(min, max),
+        // TODO: resurrecte once we have unhosted wallets
+        //1 => create_account_strategy(min, max),
+        1 => any::<RotateKeyGen>().prop_map(RotateKeyGen::arced),
+        1 => bad_txn_strategy(),
+    ]
+}
+
+/// Run these transactions and make sure that they all cost the same amount of gas.
+pub fn run_and_assert_gas_cost_stability(
+    universe: AccountUniverseGen,
+    transaction_gens: Vec<impl AUTransactionGen + Clone>,
+) -> Result<(), TestCaseError> {
+    let mut executor = FakeExecutor::from_genesis_file();
+    let mut universe = universe.setup_gas_cost_stability(&mut executor);
+    let (transactions, expected_values): (Vec<_>, Vec<_>) = transaction_gens
+        .iter()
+        .map(|transaction_gen| transaction_gen.clone().apply(&mut universe))
+        .unzip();
+    let outputs = executor.execute_block(transactions).unwrap();
+
+    for (idx, (output, expected_value)) in outputs.iter().zip(&expected_values).enumerate() {
+        prop_assert!(
+            transaction_status_eq(output.status(), &expected_value.0),
+            "unexpected status for transaction {}",
+            idx
+        );
+        prop_assert_eq!(
+            output.gas_used(),
+            expected_value.1,
+            "transaction at idx {} did not have expected gas cost",
+            idx,
+        );
+    }
+    Ok(())
+}
+
+/// Run these transactions and verify the expected output.
+pub fn run_and_assert_universe(
+    universe: AccountUniverseGen,
+    transaction_gens: Vec<impl AUTransactionGen + Clone>,
+) -> Result<(), TestCaseError> {
+    let mut executor = FakeExecutor::from_genesis_file();
+    let mut universe = universe.setup(&mut executor);
+    let (transactions, expected_values): (Vec<_>, Vec<_>) = transaction_gens
+        .iter()
+        .map(|transaction_gen| transaction_gen.clone().apply(&mut universe))
+        .unzip();
+    let outputs = executor.execute_block(transactions).unwrap();
+
+    prop_assert_eq!(outputs.len(), expected_values.len());
+
+    for (idx, (output, expected)) in outputs.iter().zip(&expected_values).enumerate() {
+        prop_assert!(
+            transaction_status_eq(output.status(), &expected.0),
+            "unexpected status for transaction {}",
+            idx
+        );
+        executor.apply_write_set(output.write_set());
+    }
+
+    assert_accounts_match(&universe, &executor)
+}
+
+/// Verify that the account information in the universe matches the information in the executor.
+pub fn assert_accounts_match(
+    universe: &AccountUniverse,
+    executor: &FakeExecutor,
+) -> Result<(), TestCaseError> {
+    for (idx, account) in universe.accounts().iter().enumerate() {
+        let resource = executor
+            .read_account_resource(&account.account())
+            .expect("account resource must exist");
+        let resource_balance = executor
+            .read_balance_resource(account.account(), account::lbr_currency_code())
+            .expect("account balance resource must exist");
+        let auth_key = account.account().auth_key();
+        prop_assert_eq!(
+            auth_key.as_slice(),
+            resource.authentication_key(),
+            "account {} should have correct auth key",
+            idx
+        );
+        prop_assert_eq!(
+            account.balance(),
+            resource_balance.coin(),
+            "account {} should have correct balance",
+            idx
+        );
+        // XXX These two don't work at the moment because the VM doesn't bump up event counts.
+        //        prop_assert_eq!(
+        //            account.received_events_count(),
+        //            AccountResource::read_received_events_count(&resource),
+        //            "account {} should have correct received_events_count",
+        //            idx
+        //        );
+        //        prop_assert_eq!(
+        //            account.sent_events_count(),
+        //            AccountResource::read_sent_events_count(&resource),
+        //            "account {} should have correct sent_events_count",
+        //            idx
+        //        );
+        prop_assert_eq!(
+            account.sequence_number(),
+            resource.sequence_number(),
+            "account {} should have correct sequence number",
+            idx
+        );
+    }
+    Ok(())
 }

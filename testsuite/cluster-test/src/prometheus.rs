@@ -11,7 +11,8 @@ use std::{collections::HashMap, time::Duration};
 #[derive(Clone)]
 pub struct Prometheus {
     url: Url,
-    client: reqwest::Client,
+    client: reqwest::blocking::Client,
+    grafana_base_url: Url,
 }
 
 pub struct MatrixResponse {
@@ -23,12 +24,28 @@ pub struct TimeSeries {
 }
 
 impl Prometheus {
-    pub fn new(ip: &str) -> Self {
-        let url = format!("http://{}:9091", ip)
+    pub fn new(ip: &str, grafana_base_url: String) -> Self {
+        let url = format!("http://{}:80", ip)
             .parse()
             .expect("Failed to parse prometheus url");
-        let client = reqwest::Client::new();
-        Self { url, client }
+        let grafana_base_url = grafana_base_url
+            .parse()
+            .expect("Failed to parse prometheus public url");
+        let client = reqwest::blocking::Client::new();
+        Self {
+            url,
+            client,
+            grafana_base_url,
+        }
+    }
+
+    pub fn link_to_dashboard(&self, start: Duration, end: Duration) -> String {
+        format!(
+            "{}d/overview10/overview?orgId=1&from={}&to={}",
+            self.grafana_base_url,
+            start.as_millis(),
+            end.as_millis()
+        )
     }
 
     fn query_range(
@@ -41,7 +58,7 @@ impl Prometheus {
         let url = self
             .url
             .join(&format!(
-                "api/datasources/proxy/1/api/v1/query_range?query={}&start={}&end={}&step={}",
+                "api/v1/query_range?query={}&start={}&end={}&step={}",
                 query,
                 start.as_secs(),
                 end.as_secs(),
@@ -49,7 +66,7 @@ impl Prometheus {
             ))
             .expect("Failed to make query_range url");
 
-        let mut response = self
+        let response = self
             .client
             .get(url.clone())
             .send()

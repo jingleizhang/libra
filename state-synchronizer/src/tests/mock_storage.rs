@@ -2,25 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::SynchronizerState;
-use libra_crypto::hash::CryptoHash;
+use anyhow::{bail, Result};
+use executor_types::ExecutedTrees;
 use libra_crypto::HashValue;
-use libra_types::block_info::BlockInfo;
-use libra_types::crypto_proxies::ValidatorSet;
-use libra_types::crypto_proxies::{
-    ValidatorChangeEventWithProof, ValidatorSigner, ValidatorVerifier,
+#[cfg(test)]
+use libra_types::{
+    account_address::AccountAddress,
+    account_config::lbr_type_tag,
+    block_info::BlockInfo,
+    ledger_info::LedgerInfo,
+    on_chain_config::ValidatorSet,
+    test_helpers::transaction_test_helpers::get_test_signed_txn,
+    transaction::{authenticator::AuthenticationKey, SignedTransaction},
 };
 use libra_types::{
-    account_address::AccountAddress, crypto_proxies::LedgerInfoWithSignatures,
-    ledger_info::LedgerInfo, test_helpers::transaction_test_helpers::get_test_signed_txn,
-    transaction::Transaction,
+    epoch_state::EpochState, ledger_info::LedgerInfoWithSignatures, transaction::Transaction,
+    validator_signer::ValidatorSigner,
 };
-use std::collections::{BTreeMap, HashMap};
-use transaction_builder::encode_transfer_script;
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+#[cfg(test)]
+use transaction_builder::encode_peer_to_peer_with_metadata_script;
+#[cfg(test)]
 use vm_genesis::GENESIS_KEYPAIR;
 
+#[derive(Clone)]
 pub struct MockStorage {
     // some mock transactions in the storage
     transactions: Vec<Transaction>,
+    // the executed trees after applying the txns above.
+    synced_trees: ExecutedTrees,
     // latest ledger info per epoch
     ledger_infos: HashMap<u64, LedgerInfoWithSignatures>,
     // latest epoch number (starts with 1)
@@ -29,30 +41,42 @@ pub struct MockStorage {
     // All epochs are built s.t. a single signature is enough for quorum cert
     signer: ValidatorSigner,
     // A validator verifier of the latest epoch
-    verifier: ValidatorVerifier,
+    epoch_state: EpochState,
 }
 
 impl MockStorage {
     pub fn new(genesis_li: LedgerInfoWithSignatures, signer: ValidatorSigner) -> Self {
-        let verifier = genesis_li
-            .ledger_info()
-            .next_validator_set()
-            .unwrap()
-            .into();
+        let epoch_state = genesis_li.ledger_info().next_epoch_state().unwrap().clone();
         let epoch_num = genesis_li.ledger_info().epoch() + 1;
         let mut ledger_infos = HashMap::new();
         ledger_infos.insert(0, genesis_li);
         Self {
             transactions: vec![],
+            synced_trees: ExecutedTrees::new_empty(),
             ledger_infos,
             epoch_num,
             signer,
-            verifier,
+            epoch_state,
         }
+    }
+
+    fn add_txns(&mut self, txns: &mut Vec<Transaction>) {
+        self.transactions.append(txns);
+        let num_leaves = self.transactions.len() + 1;
+        let frozen_subtree_roots = vec![HashValue::zero(); num_leaves.count_ones() as usize];
+        self.synced_trees = ExecutedTrees::new(
+            HashValue::zero(), /* dummy_state_root */
+            frozen_subtree_roots,
+            num_leaves as u64,
+        );
     }
 
     pub fn version(&self) -> u64 {
         self.transactions.len() as u64
+    }
+
+    pub fn synced_trees(&self) -> &ExecutedTrees {
+        &self.synced_trees
     }
 
     pub fn epoch_num(&self) -> u64 {
@@ -72,17 +96,16 @@ impl MockStorage {
     pub fn get_local_storage_state(&self) -> SynchronizerState {
         SynchronizerState::new(
             self.highest_local_li(),
-            self.version(),
-            self.verifier.clone(),
+            self.synced_trees().clone(),
+            self.epoch_state.clone(),
         )
     }
 
-    pub fn get_epoch_changes(&self, known_epoch: u64) -> ValidatorChangeEventWithProof {
-        let mut epoch_change_lis = vec![];
-        for epoch_num in known_epoch..self.epoch_num() {
-            epoch_change_lis.push(self.ledger_infos.get(&epoch_num).unwrap().clone());
+    pub fn get_epoch_changes(&self, known_epoch: u64) -> Result<LedgerInfoWithSignatures> {
+        match self.ledger_infos.get(&known_epoch) {
+            None => bail!("[mock storage] missing epoch change li"),
+            Some(li) => Ok(li.clone()),
         }
-        ValidatorChangeEventWithProof::new(epoch_change_lis)
     }
 
     pub fn get_chunk(
@@ -91,8 +114,11 @@ impl MockStorage {
         limit: u64,
         target_version: u64,
     ) -> Vec<Transaction> {
-        let mut version = start_version;
         let mut res = vec![];
+        if target_version < start_version || start_version == 0 {
+            return res;
+        }
+        let mut version = start_version;
         let limit = std::cmp::min(limit, target_version - start_version + 1);
         while version - 1 < self.transactions.len() as u64 && version - start_version < limit {
             res.push(self.transactions[(version - 1) as usize].clone());
@@ -104,41 +130,77 @@ impl MockStorage {
     pub fn add_txns_with_li(
         &mut self,
         mut transactions: Vec<Transaction>,
-        li: LedgerInfoWithSignatures,
+        verified_target_li: LedgerInfoWithSignatures,
+        intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
     ) {
-        assert_eq!(self.epoch_num, li.ledger_info().epoch());
-        self.transactions.append(&mut transactions);
-        self.ledger_infos.insert(self.epoch_num(), li.clone());
-        if let Some(next_validator_set) = li.ledger_info().next_validator_set() {
-            self.epoch_num += 1;
-            self.verifier = next_validator_set.into();
+        self.add_txns(&mut transactions);
+        if let Some(li) = intermediate_end_of_epoch_li {
+            self.epoch_num = li.ledger_info().epoch() + 1;
+            self.ledger_infos.insert(li.ledger_info().epoch(), li);
+            return;
+        }
+        if verified_target_li.ledger_info().epoch() != self.epoch_num() {
+            return;
+        }
+
+        // store ledger info only if version matches last tx
+        if verified_target_li.ledger_info().version() == self.version() {
+            self.ledger_infos.insert(
+                verified_target_li.ledger_info().epoch(),
+                verified_target_li.clone(),
+            );
+            if let Some(next_epoch_state) = verified_target_li.ledger_info().next_epoch_state() {
+                self.epoch_num = next_epoch_state.epoch;
+                self.epoch_state = next_epoch_state.clone();
+            }
         }
     }
 
     // Generate new dummy txns and updates the LI
     // with the version corresponding to the new transactions, signed by this storage signer.
-    pub fn commit_new_txns(&mut self, num_txns: u64) {
+    #[cfg(test)]
+    pub fn commit_new_txns(&mut self, num_txns: u64) -> (Vec<Transaction>, Vec<SignedTransaction>) {
+        let mut committed_txns = vec![];
+        let mut signed_txns = vec![];
         for _ in 0..num_txns {
-            self.transactions.push(Self::gen_mock_user_txn());
+            let txn = Self::gen_mock_user_txn();
+            self.add_txns(&mut vec![txn.clone()]);
+            committed_txns.push(txn.clone());
+            if let Transaction::UserTransaction(signed_txn) = txn {
+                signed_txns.push(signed_txn);
+            }
         }
         self.add_li(None);
+        (committed_txns, signed_txns)
     }
 
+    #[cfg(test)]
     fn gen_mock_user_txn() -> Transaction {
         let sender = AccountAddress::random();
-        let receiver = AccountAddress::random();
-        let program = encode_transfer_script(&receiver, 1);
+        let receiver = AuthenticationKey::random();
+        let program = encode_peer_to_peer_with_metadata_script(
+            lbr_type_tag(),
+            receiver.derived_address(),
+            1,
+            vec![],
+            vec![],
+        );
         Transaction::UserTransaction(get_test_signed_txn(
             sender,
             0, // sequence number
-            GENESIS_KEYPAIR.0.clone(),
+            &GENESIS_KEYPAIR.0,
             GENESIS_KEYPAIR.1.clone(),
             Some(program),
         ))
     }
 
     // add the LI to the current highest version and sign it
+    #[cfg(test)]
     fn add_li(&mut self, validator_set: Option<ValidatorSet>) {
+        let epoch_state = validator_set.map(|set| EpochState {
+            epoch: self.epoch_num() + 1,
+            verifier: (&set).into(),
+        });
         let ledger_info = LedgerInfo::new(
             BlockInfo::new(
                 self.epoch_num(),
@@ -147,11 +209,11 @@ impl MockStorage {
                 HashValue::zero(),
                 self.version(),
                 0,
-                validator_set,
+                epoch_state,
             ),
             HashValue::zero(),
         );
-        let signature = self.signer.sign_message(ledger_info.hash()).unwrap();
+        let signature = self.signer.sign(&ledger_info);
         let mut signatures = BTreeMap::new();
         signatures.insert(self.signer.author(), signature);
         self.ledger_infos.insert(
@@ -160,20 +222,31 @@ impl MockStorage {
         );
     }
 
-    // This function is applying the LedgerInfo with the next validator set to the existing version
+    // This function is applying the LedgerInfo with the next epoch info to the existing version
     // (yes, it's different from reality, we're not adding any real reconfiguration txn,
     // just adding a new LedgerInfo).
     // The validator set is different only in the consensus public / private keys, network data
     // remains the same.
+    #[cfg(test)]
     pub fn move_to_next_epoch(&mut self, signer: ValidatorSigner, validator_set: ValidatorSet) {
-        self.add_li(Some(validator_set.clone()));
+        self.add_li(Some(validator_set));
         self.epoch_num += 1;
         self.signer = signer;
-        self.verifier = self
+        self.epoch_state = self
             .highest_local_li()
             .ledger_info()
-            .next_validator_set()
+            .next_epoch_state()
             .unwrap()
-            .into();
+            .clone();
+    }
+
+    // Find LedgerInfo for an epoch boundary version.
+    pub fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+        for li in self.ledger_infos.values() {
+            if li.ledger_info().version() == version && li.ledger_info().ends_epoch() {
+                return Ok(li.clone());
+            }
+        }
+        bail!("No LedgerInfo found for version {}", version);
     }
 }
